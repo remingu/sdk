@@ -18,12 +18,14 @@ package heal_test
 
 import (
 	"context"
+	"io/ioutil"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
@@ -35,8 +37,9 @@ import (
 )
 
 const (
-	waitForTimeout = 5 * time.Second
-	tickTimeout    = 10 * time.Millisecond
+	waitForTimeout  = 50 * time.Millisecond
+	waitHealTimeout = 500 * time.Millisecond
+	tickTimeout     = 10 * time.Millisecond
 )
 
 type testOnHeal struct {
@@ -53,7 +56,8 @@ func (t *testOnHeal) Close(ctx context.Context, in *networkservice.Connection, o
 }
 
 func TestHealClient_Request(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
 	eventCh := make(chan *networkservice.ConnectionEvent, 1)
 	defer close(eventCh)
 
@@ -92,6 +96,7 @@ func TestHealClient_Request(t *testing.T) {
 		},
 	}
 
+	t1 := time.Now()
 	eventCh <- &networkservice.ConnectionEvent{
 		Type: networkservice.ConnectionEventType_DELETE,
 		Connections: map[string]*networkservice.Connection{
@@ -101,68 +106,22 @@ func TestHealClient_Request(t *testing.T) {
 			},
 		},
 	}
-
-	cond := func() bool {
-		select {
-		case <-onHealCh:
-			return true
-		default:
-			return false
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), waitHealTimeout)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		require.FailNow(t, "timeout waiting for Heal event %v", time.Since(t1))
+		return
+	case <-onHealCh:
+		// All is fine, test is passed
+		break
 	}
-	require.Eventually(t, cond, waitForTimeout, tickTimeout)
-}
-
-func TestHealClient_MonitorClose(t *testing.T) {
-	defer goleak.VerifyNone(t)
-	eventCh := make(chan *networkservice.ConnectionEvent, 1)
-	defer close(eventCh)
-
-	onHealCh := make(chan struct{})
-	onHeal := &testOnHeal{
-		RequestFunc: func(ctx context.Context, in *networkservice.NetworkServiceRequest, opts ...grpc.CallOption) (connection *networkservice.Connection, e error) {
-			close(onHealCh)
-			return &networkservice.Connection{}, nil
-		},
-	}
-
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	client := chain.NewNetworkServiceClient(
-		heal.NewClient(ctx, eventchannel.NewMonitorConnectionClient(eventCh), addressof.NetworkServiceClient(onHeal)))
-
-	_, err := client.Request(context.Background(), &networkservice.NetworkServiceRequest{
-		Connection: &networkservice.Connection{
-			Id:             "conn-1",
-			NetworkService: "ns-1",
-		},
-	})
-	require.Nil(t, err)
-
-	eventCh <- &networkservice.ConnectionEvent{
-		Type: networkservice.ConnectionEventType_INITIAL_STATE_TRANSFER,
-		Connections: map[string]*networkservice.Connection{
-			"conn-1": {
-				Id:             "conn-1",
-				NetworkService: "ns-1",
-			},
-		},
-	}
-
-	cancelFunc()
-
-	cond := func() bool {
-		select {
-		case <-onHealCh:
-			return true
-		default:
-			return false
-		}
-	}
-	require.Eventually(t, cond, waitForTimeout, tickTimeout)
+	logrus.Infof("passed with total time: %v", time.Since(t1))
 }
 
 func TestHealClient_EmptyInit(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
 	eventCh := make(chan *networkservice.ConnectionEvent, 1)
 	defer close(eventCh)
 
@@ -171,7 +130,9 @@ func TestHealClient_EmptyInit(t *testing.T) {
 	client := chain.NewNetworkServiceClient(
 		heal.NewClient(ctx, eventchannel.NewMonitorConnectionClient(eventCh), nil))
 
-	_, err := client.Request(context.Background(), &networkservice.NetworkServiceRequest{
+	ctx, cancel := context.WithTimeout(ctx, waitForTimeout)
+	defer cancel()
+	_, err := client.Request(ctx, &networkservice.NetworkServiceRequest{
 		Connection: &networkservice.Connection{
 			Id:             "conn-1",
 			NetworkService: "ns-1",
@@ -196,7 +157,9 @@ func TestHealClient_EmptyInit(t *testing.T) {
 }
 
 func TestNewClient_MissingConnectionsInInit(t *testing.T) {
-	defer goleak.VerifyNone(t)
+	t.Skip("https://github.com/networkservicemesh/sdk/issues/375")
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
 	eventCh := make(chan *networkservice.ConnectionEvent, 1)
 
 	requestCh := make(chan *networkservice.NetworkServiceRequest)
@@ -217,11 +180,13 @@ func TestNewClient_MissingConnectionsInInit(t *testing.T) {
 		{Id: "conn-2", NetworkService: "ns-2"},
 	}
 
-	conn, err := client.Request(context.Background(), &networkservice.NetworkServiceRequest{Connection: conns[0]})
+	ctx, cancel := context.WithTimeout(ctx, waitForTimeout)
+	defer cancel()
+	conn, err := client.Request(ctx, &networkservice.NetworkServiceRequest{Connection: conns[0]})
 	require.Nil(t, err)
 	require.True(t, reflect.DeepEqual(conn, conns[0]))
 
-	conn, err = client.Request(context.Background(), &networkservice.NetworkServiceRequest{Connection: conns[1]})
+	conn, err = client.Request(ctx, &networkservice.NetworkServiceRequest{Connection: conns[1]})
 	require.Nil(t, err)
 	require.True(t, reflect.DeepEqual(conn, conns[1]))
 

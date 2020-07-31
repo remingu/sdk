@@ -20,12 +20,13 @@ import (
 	"context"
 	"net/url"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clienturl"
+
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clienturl"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/discover"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 )
@@ -62,9 +63,12 @@ func (s *selectEndpointServer) Close(ctx context.Context, conn *networkservice.C
 func (s *selectEndpointServer) withClientURL(ctx context.Context, conn *networkservice.Connection) (context.Context, error) {
 	if clienturl.ClientURL(ctx) == nil {
 		candidates := discover.Candidates(ctx)
-		endpoint := s.selector.selectEndpoint(candidates.GetNetworkService(), candidates.GetNetworkServiceEndpoints())
+		endpoint := s.selector.selectEndpoint(candidates.NetworkService, candidates.Endpoints)
+		if endpoint == nil {
+			return nil, errors.Errorf("failed to find endpoint for Network Service: %v %v", candidates.NetworkService, candidates.Endpoints)
+		}
 		conn.NetworkServiceEndpointName = endpoint.GetName()
-		urlString := candidates.GetNetworkServiceManagers()[endpoint.GetNetworkServiceManagerName()].GetUrl()
+		urlString := endpoint.Url
 		u, err := url.Parse(urlString)
 		if err != nil {
 			return nil, errors.WithStack(err)

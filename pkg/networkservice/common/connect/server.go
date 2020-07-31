@@ -1,5 +1,4 @@
 // Copyright (c) 2020 Doc.ai and/or its affiliates.
-//
 // Copyright (c) 2020 Cisco and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
@@ -28,87 +27,113 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clienturl"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/utils/inject/injecterror"
+	"github.com/networkservicemesh/sdk/pkg/tools/clientmap"
 )
 
 type connectServer struct {
-	ctx                     context.Context
-	dialOptions             []grpc.DialOption
-	clientFactory           func(ctx context.Context, conn grpc.ClientConnInterface) networkservice.NetworkServiceClient
-	uRLToClientMap          clientMap // key == url as string
-	connectionIDToClientMap clientMap // key == connection.GetId()
+	ctx               context.Context
+	clientFactory     func(ctx context.Context, cc grpc.ClientConnInterface) networkservice.NetworkServiceClient
+	clientDialOptions []grpc.DialOption
+	clientsByURL      clientmap.RefcountMap // key == clientURL.String()
+	clientsByID       clientmap.Map         // key == client connection ID
 }
 
-// NewServer - returns a new connect Server
-//             clientFactory - a function which takes a ctx that governs the lifecycle of the client and
-//                             a cc grpc.ClientConnInterface and returns a networkservice.NetworkServiceClient
-//                             The returned client will be called with the same inputs that were passed to the connect Server.
-//                             This means that the client returned by clientFactory is responsible for any mutations to that
-//                             request (setting a new id, setting different Mechanism Preferences etc) and any mutations
-//                             before returning to the server.
-//             connect presumes depends on some previous chain element having set clienturl.WithClientURL so it can know
-//             which client to address.
-func NewServer(clientFactory func(ctx context.Context, cc grpc.ClientConnInterface) networkservice.NetworkServiceClient, clientDialOptions ...grpc.DialOption) networkservice.NetworkServiceServer {
+// NewServer - chain element that
+func NewServer(ctx context.Context, clientFactory func(ctx context.Context, cc grpc.ClientConnInterface) networkservice.NetworkServiceClient, clientDialOptions ...grpc.DialOption) networkservice.NetworkServiceServer {
 	return &connectServer{
-		ctx:                     nil,
-		clientFactory:           clientFactory,
-		uRLToClientMap:          newClientMap(),
-		connectionIDToClientMap: newClientMap(),
-		dialOptions:             clientDialOptions,
+		ctx:               ctx,
+		clientFactory:     clientFactory,
+		clientDialOptions: clientDialOptions,
 	}
 }
 
 func (c *connectServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
-	client, found := c.connectionIDToClientMap.Load(request.GetConnection().GetId())
-	if found {
-		return client.Request(ctx, request)
+	clientConn, clientErr := c.client(ctx, request.GetConnection()).Request(ctx, request)
+
+	if clientErr != nil {
+		return nil, clientErr
 	}
-	u := clienturl.ClientURL(ctx)
-	client, found = c.uRLToClientMap.Load(u.String())
-	if found {
-		c.connectionIDToClientMap.LoadOrStore(request.GetConnection().GetId(), client)
-		return client.Request(ctx, request)
-	}
-	// TODO - do something with cancelFunc to clean up uRLToClientMap when we are done with them (maybe ref counting on Close?)
-	clientCtx, _ := context.WithCancel(context.Background())
-	// TODO - fix to accept dialOptions from github.com/networkservicemesh/sdk/tools/security - the options should flow in from the top
-	// TODO - fix to accept a mockable interface we can pass in from the top other than DialContext
-	// TODO - fix to be cautious about schemes
-	cc, err := grpc.DialContext(clientCtx, u.String(), c.dialOptions...)
-	if err != nil {
-		return nil, errors.Wrapf(err, "Unable to dial %s", u.String())
-	}
-	client = c.clientFactory(clientCtx, cc)
-	client, _ = c.uRLToClientMap.LoadOrStore(u.String(), client)
-	client, _ = c.connectionIDToClientMap.LoadOrStore(request.GetConnection().GetId(), client)
-	conn, err := client.Request(ctx, request)
+	// Copy Context from client to response from server
+	request.GetConnection().Context = clientConn.Context
+	request.GetConnection().Path = clientConn.Path
+
+	// Carry on with next.Server
+	conn, err := next.Server(ctx).Request(ctx, request)
 	if err != nil {
 		return nil, err
 	}
+
+	// Return result
 	return conn, err
 }
 
 func (c *connectServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
-	client, found := c.connectionIDToClientMap.Load(conn.GetId())
-	if found {
-		return client.Close(ctx, conn)
+	var clientErr error
+	client, _ := c.clientsByID.Load(conn.GetId())
+	if client == nil {
+		return &empty.Empty{}, nil
 	}
-	u := clienturl.ClientURL(ctx)
-	client, found = c.uRLToClientMap.Load(u.String())
-	if found {
-		c.connectionIDToClientMap.LoadOrStore(conn.GetId(), client)
-		return client.Close(ctx, conn)
+	_, clientErr = client.Close(ctx, conn)
+	rv, err := next.Server(ctx).Close(ctx, conn)
+	if clientErr != nil && err != nil {
+		return rv, errors.Wrapf(err, "errors during client close: %v", clientErr)
 	}
-	// TODO - do something with cancelFunc to clean up uRLToClientMap when we are done with them (maybe ref counting on Close?)
-	clientCtx, _ := context.WithCancel(context.Background())
-	// TODO - fix to accept dialOptions from github.com/networkservicemesh/sdk/tools/security - the options should flow in from the top
-	// TODO - fix to accept a mockable interface we can pass in from the top other than DialContext
-	// TODO - fix to be cautious about schemes
-	cc, err := grpc.DialContext(clientCtx, u.String(), c.dialOptions...)
-	if err != nil {
-		return nil, err
+	if clientErr != nil {
+		return rv, errors.Wrap(clientErr, "errors during client close")
 	}
-	client = c.clientFactory(clientCtx, cc)
-	client, _ = c.uRLToClientMap.LoadOrStore(u.String(), client)
-	client, _ = c.connectionIDToClientMap.LoadOrStore(conn.GetId(), client)
-	return client.Close(ctx, conn)
+	return rv, err
+}
+
+func (c *connectServer) client(ctx context.Context, conn *networkservice.Connection) networkservice.NetworkServiceClient {
+	// Fast path, if we have a client for this conn.GetId(), use it
+	client, _ := c.clientsByID.Load(conn.GetId())
+
+	// If we didn't find a client, we fall back to clientURL
+	if client == nil {
+		clientURL := clienturl.ClientURL(ctx)
+		// If we don't have a clientURL, all we can do is return errors
+		if clientURL == nil {
+			clientErr := errors.Errorf("clientURL not found for incoming connection: %+v", conn)
+			return injecterror.NewClient(clientErr)
+		}
+		// Fast path: load the client by URL.  In the unfortunate event someone has poorly chosen
+		// a clientFactory or dialOptions that take time, this will be faster than
+		// creating a new one and doing a LoadOrStore
+		client, _ = c.clientsByURL.Load(clientURL.String())
+		// If we still don't have a client, create one, and LoadOrStore it
+		// Note: It is possible for multiple nearly simultaneous initial Requests to race this client == nil check
+		// and both enter into the body of the if block.  However, if that occurs, when they call call clientByID.LoadAndStore
+		// only one of them will Store, the rest will Load.
+		// The return of load == true from the clientById.LoadAndStore(conn.GetId()) indicates that there has been
+		// a race, and those receiving it must then call clientByURL.Delete(clientURL) to clean up the Refcount, so
+		// we only get one refcount increment per conn.GetId().  In this way correctness is preserved, even in the
+		// unlikely case of multiple nearly simultaneous initial Requests racing this client == nil
+		if client == nil {
+			// Note: clienturl.NewClient(...) will get properly cleaned up when dereferences
+			client = clienturl.NewClient(clienturl.WithClientURL(c.ctx, clientURL), c.clientFactory, c.clientDialOptions...)
+			client, _ = c.clientsByURL.LoadOrStore(clientURL.String(), client)
+			// Wrap the client in a per-connection connect.NewClient(...)
+			// when this client receive a 'Close' it will call the cancelFunc provided deleting it from the various
+			// maps.
+			client = chain.NewNetworkServiceClient(
+				NewClient(func() {
+					c.clientsByID.Delete(conn.GetId())
+					c.clientsByURL.Delete(clientURL.String())
+				}),
+				client,
+			)
+			var loaded bool
+			client, loaded = c.clientsByID.LoadOrStore(conn.GetId(), client)
+			if loaded {
+				// If loaded == true, then another Request for the same conn.GetId() was being processed in parallel
+				// since both of those called c.clientsByURL.LoadOrStore, the refcount for this one conn.GetId()
+				// got incremented *twice*.  Correct for that here by decrementing
+				c.clientsByURL.Delete(conn.GetId())
+			}
+		}
+	}
+	return client
 }

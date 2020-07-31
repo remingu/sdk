@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco and/or its affiliates.
 //
+// Copyright (c) 2020 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,13 +16,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package nsmgr provides a Network Service Manager (nsmgr), but interface and implementation
+// Package nsmgr provides a Network Service Manager (nsmgrServer), but interface and implementation
 package nsmgr
 
 import (
+	"context"
+
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
-	"github.com/networkservicemesh/api/pkg/api/registry"
+	registryapi "github.com/networkservicemesh/api/pkg/api/registry"
 	"google.golang.org/grpc"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/excludedprefixes"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/registry"
+	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
+
+	"github.com/networkservicemesh/sdk/pkg/registry/common/setid"
+	"github.com/networkservicemesh/sdk/pkg/registry/common/seturl"
+	chain_registry "github.com/networkservicemesh/sdk/pkg/registry/core/chain"
+	"github.com/networkservicemesh/sdk/pkg/registry/core/nextwrap"
+	"github.com/networkservicemesh/sdk/pkg/registry/memory"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/endpoint"
@@ -30,49 +45,101 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/roundrobin"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/adapters"
 	adapter_registry "github.com/networkservicemesh/sdk/pkg/registry/core/adapters"
-	chain_registry "github.com/networkservicemesh/sdk/pkg/registry/core/chain"
 	"github.com/networkservicemesh/sdk/pkg/tools/addressof"
 	"github.com/networkservicemesh/sdk/pkg/tools/token"
 )
 
 // Nsmgr - A simple combintation of the Endpoint, registry.NetworkServiceRegistryServer, and registry.NetworkServiceDiscoveryServer interfaces
 type Nsmgr interface {
-	endpoint.Endpoint
-	registry.NetworkServiceRegistryServer
-	registry.NetworkServiceDiscoveryServer
+	networkservice.NetworkServiceServer
+	networkservice.MonitorConnectionServer
+	registry.Registry
 }
 
-type nsmgr struct {
+type nsmgrServer struct {
 	endpoint.Endpoint
-	registry.NetworkServiceRegistryServer
-	registry.NetworkServiceDiscoveryServer
+	registry.Registry
 }
 
 // NewServer - Creates a new Nsmgr
-//           name - name of the Nsmgr
+//           nsmRegistration - Nsmgr registration
 //           authzServer - authorization server chain element
-//           registryCC - client connection to reach the upstream registry
-func NewServer(name string, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, registryCC grpc.ClientConnInterface, dialOptions ...grpc.DialOption) Nsmgr {
-	rv := &nsmgr{}
-	rv.Endpoint = endpoint.NewServer(
-		name,
+//           tokenGenerator - authorization token generator
+//           registryCC - client connection to reach the upstream registry, could be nil, in this case only in memory storage will be used.
+// 			 clientDialOptions -  a grpc.DialOption's to be passed to GRPC connections.
+func NewServer(ctx context.Context, nsmRegistration *registryapi.NetworkServiceEndpoint, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, registryCC grpc.ClientConnInterface, clientDialOptions ...grpc.DialOption) Nsmgr {
+	rv := &nsmgrServer{}
+
+	var localbypassRegistryServer registryapi.NetworkServiceEndpointRegistryServer
+
+	nsRegistry := newRemoteNSServer(registryCC)
+	if nsRegistry == nil {
+		// Use memory registry if no registry is passed
+		nsRegistry = memory.NewNetworkServiceRegistryServer()
+	}
+
+	nseRegistry := newRemoteNSEServer(registryCC)
+	if nseRegistry == nil {
+		nseRegistry = chain_registry.NewNetworkServiceEndpointRegistryServer(
+			setid.NewNetworkServiceEndpointRegistryServer(),  // If no remote registry then assign ID.
+			memory.NewNetworkServiceEndpointRegistryServer(), // Memory registry to store result inside.
+		)
+	}
+
+	// Construct Endpoint
+	rv.Endpoint = endpoint.NewServer(ctx,
+		nsmRegistration.Name,
 		authzServer,
 		tokenGenerator,
-		discover.NewServer(registry.NewNetworkServiceDiscoveryClient(registryCC)),
+		discover.NewServer(adapter_registry.NetworkServiceServerToClient(nsRegistry), adapter_registry.NetworkServiceEndpointServerToClient(nseRegistry)),
 		roundrobin.NewServer(),
-		localbypass.NewServer(&rv.NetworkServiceRegistryServer),
-		connect.NewServer(client.NewClientFactory(name, addressof.NetworkServiceClient(adapters.NewServerToClient(rv)), tokenGenerator), dialOptions...),
+		localbypass.NewServer(&localbypassRegistryServer),
+		excludedprefixes.NewServer(),
+		connect.NewServer(
+			ctx,
+			client.NewClientFactory(nsmRegistration.Name,
+				addressof.NetworkServiceClient(
+					adapters.NewServerToClient(rv)),
+				tokenGenerator),
+			clientDialOptions...),
 	)
-	rv.NetworkServiceRegistryServer = chain_registry.NewNetworkServiceRegistryServer(
-		rv.NetworkServiceRegistryServer,
-		adapter_registry.NewRegistryClientToServer(registry.NewNetworkServiceRegistryClient(registryCC)),
+
+	nsChain := chain_registry.NewNetworkServiceRegistryServer(nsRegistry)
+	nseChain := chain_registry.NewNetworkServiceEndpointRegistryServer(
+		localbypassRegistryServer, // Store endpoint Id to EndpointURL for local access.
+		seturl.NewNetworkServiceEndpointRegistryServer(nsmRegistration.Url), // Remember endpoint URL
+		nseRegistry, // Register NSE inside Remote registry with ID assigned
 	)
-	rv.NetworkServiceDiscoveryServer = adapter_registry.NewDiscoveryClientToServer(registry.NewNetworkServiceDiscoveryClient(registryCC))
+	rv.Registry = registry.NewServer(nsChain, nseChain)
+
 	return rv
 }
 
-func (n *nsmgr) Register(s *grpc.Server) {
-	n.Endpoint.Register(s)
-	registry.RegisterNetworkServiceRegistryServer(s, n)
-	registry.RegisterNetworkServiceDiscoveryServer(s, n)
+func newRemoteNSServer(cc grpc.ClientConnInterface) registryapi.NetworkServiceRegistryServer {
+	if cc != nil {
+		return adapter_registry.NetworkServiceClientToServer(
+			nextwrap.NewNetworkServiceRegistryClient(
+				registryapi.NewNetworkServiceRegistryClient(cc)))
+	}
+	return nil
 }
+func newRemoteNSEServer(cc grpc.ClientConnInterface) registryapi.NetworkServiceEndpointRegistryServer {
+	if cc != nil {
+		return adapter_registry.NetworkServiceEndpointClientToServer(
+			nextwrap.NewNetworkServiceEndpointRegistryClient(
+				registryapi.NewNetworkServiceEndpointRegistryClient(cc)))
+	}
+	return nil
+}
+
+func (n *nsmgrServer) Register(s *grpc.Server) {
+	grpcutils.RegisterHealthServices(s, n, n.NetworkServiceEndpointRegistryServer(), n.NetworkServiceRegistryServer())
+	networkservice.RegisterNetworkServiceServer(s, n)
+	networkservice.RegisterMonitorConnectionServer(s, n)
+	registryapi.RegisterNetworkServiceRegistryServer(s, n.Registry.NetworkServiceRegistryServer())
+	registryapi.RegisterNetworkServiceEndpointRegistryServer(s, n.Registry.NetworkServiceEndpointRegistryServer())
+}
+
+var _ Nsmgr = &nsmgrServer{}
+var _ endpoint.Endpoint = &nsmgrServer{}
+var _ registry.Registry = &nsmgrServer{}

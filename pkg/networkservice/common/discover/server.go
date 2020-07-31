@@ -18,6 +18,9 @@ package discover
 
 import (
 	"context"
+	"net/url"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/clienturl"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
@@ -29,29 +32,63 @@ import (
 )
 
 type discoverCandidatesServer struct {
-	registry registry.NetworkServiceDiscoveryClient
+	nseClient registry.NetworkServiceEndpointRegistryClient
+	nsClient  registry.NetworkServiceRegistryClient
 }
 
 // NewServer - creates a new NetworkServiceServer that can discover possible candidates for providing a requested
 //             Network Service and add it to the context.Context where it can be retrieved by Candidates(ctx)
-func NewServer(reg registry.NetworkServiceDiscoveryClient) networkservice.NetworkServiceServer {
-	return &discoverCandidatesServer{registry: reg}
+func NewServer(nsClient registry.NetworkServiceRegistryClient, nseClient registry.NetworkServiceEndpointRegistryClient) networkservice.NetworkServiceServer {
+	return &discoverCandidatesServer{
+		nseClient: nseClient,
+		nsClient:  nsClient,
+	}
 }
 
 func (d *discoverCandidatesServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
-	// TODO - handle case where NetworkServiceEndpoint is already set
-	// if request.GetConnection().GetNetworkServiceEndpointName() != "" {
-	//    TODO what to do in this case?
-	// }
-	registryRequest := &registry.FindNetworkServiceRequest{
-		NetworkServiceName: request.GetConnection().GetNetworkService(),
+	nseName := request.GetConnection().GetNetworkServiceEndpointName()
+	if nseName != "" {
+		nseStream, err := d.nseClient.Find(context.Background(), &registry.NetworkServiceEndpointQuery{
+			NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
+				Name: nseName,
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		nseList := registry.ReadNetworkServiceEndpointList(nseStream)
+		if len(nseList) == 0 {
+			return nil, errors.Errorf("network service endpoint %s is not found", nseName)
+		}
+		u, err := url.Parse(nseList[0].Url)
+		if err != nil {
+			return nil, err
+		}
+		return next.Server(ctx).Request(clienturl.WithClientURL(ctx, u), request)
 	}
-	registryResponse, err := d.registry.FindNetworkService(ctx, registryRequest)
+	nseStream, err := d.nseClient.Find(ctx, &registry.NetworkServiceEndpointQuery{
+		NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
+			NetworkServiceNames: []string{request.GetConnection().GetNetworkService()},
+		},
+	})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	registryResponse.NetworkServiceEndpoints = matchEndpoint(request.GetConnection().GetLabels(), registryResponse.GetNetworkService(), registryResponse.GetNetworkServiceEndpoints())
-	ctx = WithCandidates(ctx, registryResponse)
+
+	nseList := registry.ReadNetworkServiceEndpointList(nseStream)
+
+	nsStream, err := d.nsClient.Find(ctx, &registry.NetworkServiceQuery{
+		NetworkService: &registry.NetworkService{
+			Name: request.GetConnection().GetNetworkService(),
+		},
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	nsList := registry.ReadNetworkServiceList(nsStream)
+	nseList = matchEndpoint(request.GetConnection().GetLabels(), nsList[0], nseList)
+	ctx = WithCandidates(ctx, nseList, nsList[0])
 	return next.Server(ctx).Request(ctx, request)
 }
 

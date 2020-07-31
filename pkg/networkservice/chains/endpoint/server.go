@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
+// Copyright (c) 2020 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +20,13 @@
 package endpoint
 
 import (
-	"github.com/networkservicemesh/api/pkg/api"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health"
-	"google.golang.org/grpc/health/grpc_health_v1"
+	"context"
+	"net/url"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
+	"google.golang.org/grpc"
+
+	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/monitor"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/setid"
@@ -35,7 +38,7 @@ import (
 
 // Endpoint - aggregates the APIs:
 //            - networkservice.NetworkServiceServer
-//            -networkservice.MonitorConnectionServer
+//            - networkservice.MonitorConnectionServer
 type Endpoint interface {
 	networkservice.NetworkServiceServer
 	networkservice.MonitorConnectionServer
@@ -54,14 +57,14 @@ type endpoint struct {
 //             - authzServer authorization server chain element
 //             - tokenGenerator - token.GeneratorFunc - generates tokens for use in Path
 //             - additionalFunctionality - any additional NetworkServiceServer chain elements to be included in the chain
-func NewServer(name string, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, additionalFunctionality ...networkservice.NetworkServiceServer) Endpoint {
+func NewServer(ctx context.Context, name string, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, additionalFunctionality ...networkservice.NetworkServiceServer) Endpoint {
 	rv := &endpoint{}
 	var ns networkservice.NetworkServiceServer = rv
 	rv.NetworkServiceServer = chain.NewNetworkServiceServer(
 		append([]networkservice.NetworkServiceServer{
 			authzServer,
 			setid.NewServer(name),
-			monitor.NewServer(&rv.MonitorConnectionServer),
+			monitor.NewServer(ctx, &rv.MonitorConnectionServer),
 			timeout.NewServer(&ns),
 			updatepath.NewServer(name, tokenGenerator),
 		}, additionalFunctionality...)...)
@@ -69,12 +72,15 @@ func NewServer(name string, authzServer networkservice.NetworkServiceServer, tok
 }
 
 func (e *endpoint) Register(s *grpc.Server) {
+	grpcutils.RegisterHealthServices(s, e)
 	networkservice.RegisterNetworkServiceServer(s, e)
 	networkservice.RegisterMonitorConnectionServer(s, e)
-	// Create GRPC Health Server:
-	healthServer := health.NewServer()
-	grpc_health_v1.RegisterHealthServer(s, healthServer)
-	for _, service := range api.ServiceNames(e) {
-		healthServer.SetServingStatus(service, grpc_health_v1.HealthCheckResponse_SERVING)
-	}
+}
+
+// Serve  - serves passed Endpoint on grpc
+func Serve(ctx context.Context, listenOn *url.URL, endpoint Endpoint, opt ...grpc.ServerOption) <-chan error {
+	server := grpc.NewServer(opt...)
+	endpoint.Register(server)
+
+	return grpcutils.ListenAndServe(ctx, listenOn, server)
 }

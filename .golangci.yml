@@ -5,6 +5,16 @@ run:
   issues-exit-code: 1
   tests: true
 linters-settings:
+  goheader:
+    template-path: ".license/template.txt"
+    values:
+      const:
+        year: 2020
+      regexp:
+        year-range: ((\d\d\d\d-{{year}})|({{year}}))
+        company: .*
+        copyright-holder: Copyright \(c\) {{year-range}} {{company}}\n\n
+        copyright-holders: ({{copyright-holder}})+
   errcheck:
     check-type-assertions: false
     check-blank: false
@@ -29,6 +39,7 @@ linters-settings:
     threshold: 150
   funlen:
     Lines: 100
+    Statements: 50
   goconst:
     min-len: 2
     min-occurrences: 2
@@ -121,6 +132,7 @@ linters:
   disable-all: true
   enable:
     # - rowserrcheck
+    - goheader
     - bodyclose
     - deadcode
     - depguard
@@ -164,6 +176,9 @@ issues:
       linters:
         - dupl
         - golint
+    - path: .*registry.*.go
+      linters:
+        - dupl
     # TODO - remove after deciding how to properly handle the cancel
     - path: pkg/networkservice/common/connect/server.go
       linters:
@@ -174,6 +189,10 @@ issues:
       linters:
         - funlen
       text: "Function 'TestMonitor' is too long"
+    - path: pkg/networkservice/common/connect/server_test.go
+      linters:
+        - funlen
+      text: "Function 'TestConnectServerShouldNotPanicOnRequest' is too long"
     - path: pkg/networkservice/utils/checks/checkerror/server_test.go
       linters:
         - dupl

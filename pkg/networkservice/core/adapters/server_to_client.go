@@ -20,6 +20,8 @@ package adapters
 import (
 	"context"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
+
 	"github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/grpc"
 
@@ -32,13 +34,35 @@ type serverToClient struct {
 
 // NewServerToClient - returns a new networkservice.NetworkServiceClient that is a wrapper around server
 func NewServerToClient(server networkservice.NetworkServiceServer) networkservice.NetworkServiceClient {
-	return &serverToClient{server: server}
+	return &serverToClient{server: next.NewNetworkServiceServer(server, &contextServer{})}
 }
 
 func (s *serverToClient) Request(ctx context.Context, in *networkservice.NetworkServiceRequest, _ ...grpc.CallOption) (*networkservice.Connection, error) {
-	return s.server.Request(ctx, in)
+	doneCtx := withCapturedContext(ctx)
+	conn, err := s.server.Request(doneCtx, in)
+	if err != nil {
+		return nil, err
+	}
+	lastCtx := getCapturedContext(doneCtx)
+	if lastCtx == nil {
+		return conn, nil
+	}
+	if in == nil {
+		in = &networkservice.NetworkServiceRequest{}
+	}
+	in.Connection = conn
+	return next.Client(ctx).Request(lastCtx, in)
 }
 
 func (s *serverToClient) Close(ctx context.Context, in *networkservice.Connection, _ ...grpc.CallOption) (*empty.Empty, error) {
-	return s.server.Close(ctx, in)
+	doneCtx := withCapturedContext(ctx)
+	conn, err := s.server.Close(doneCtx, in)
+	if err != nil {
+		return nil, err
+	}
+	lastCtx := getCapturedContext(doneCtx)
+	if lastCtx == nil {
+		return conn, nil
+	}
+	return next.Client(ctx).Close(lastCtx, in)
 }

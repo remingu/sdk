@@ -22,6 +22,8 @@ import (
 
 	"github.com/golang/protobuf/ptypes/empty"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
+
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 )
 
@@ -31,13 +33,35 @@ type clientToServer struct {
 
 // NewClientToServer - returns a networkservice.NetworkServiceServer wrapped around the supplied client
 func NewClientToServer(client networkservice.NetworkServiceClient) networkservice.NetworkServiceServer {
-	return &clientToServer{client: client}
+	return &clientToServer{client: next.NewNetworkServiceClient(client, &contextClient{})}
 }
 
 func (c *clientToServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
-	return c.client.Request(ctx, request)
+	doneCtx := withCapturedContext(ctx)
+	conn, err := c.client.Request(doneCtx, request)
+	if err != nil {
+		return nil, err
+	}
+	lastCtx := getCapturedContext(doneCtx)
+	if lastCtx == nil {
+		return conn, nil
+	}
+	if request == nil {
+		request = &networkservice.NetworkServiceRequest{}
+	}
+	request.Connection = conn
+	return next.Server(ctx).Request(lastCtx, request)
 }
 
 func (c *clientToServer) Close(ctx context.Context, request *networkservice.Connection) (*empty.Empty, error) {
-	return c.client.Close(ctx, request)
+	doneCtx := withCapturedContext(ctx)
+	conn, err := c.client.Close(doneCtx, request)
+	if err != nil {
+		return nil, err
+	}
+	lastCtx := getCapturedContext(doneCtx)
+	if lastCtx == nil {
+		return conn, nil
+	}
+	return next.Server(ctx).Close(lastCtx, request)
 }
