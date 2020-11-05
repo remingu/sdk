@@ -22,13 +22,19 @@ package nsmgr
 import (
 	"context"
 
+	"github.com/networkservicemesh/sdk/pkg/registry/common/querycache"
+	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/filtermechanisms"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/interpose"
+	"github.com/networkservicemesh/sdk/pkg/registry"
+
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	registryapi "github.com/networkservicemesh/api/pkg/api/registry"
 	"google.golang.org/grpc"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/excludedprefixes"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/registry"
 	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 
 	"github.com/networkservicemesh/sdk/pkg/registry/common/setid"
@@ -61,6 +67,8 @@ type nsmgrServer struct {
 	registry.Registry
 }
 
+var _ Nsmgr = (*nsmgrServer)(nil)
+
 // NewServer - Creates a new Nsmgr
 //           nsmRegistration - Nsmgr registration
 //           authzServer - authorization server chain element
@@ -70,6 +78,7 @@ type nsmgrServer struct {
 func NewServer(ctx context.Context, nsmRegistration *registryapi.NetworkServiceEndpoint, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, registryCC grpc.ClientConnInterface, clientDialOptions ...grpc.DialOption) Nsmgr {
 	rv := &nsmgrServer{}
 
+	var urlsRegistryServer registryapi.NetworkServiceEndpointRegistryServer
 	var localbypassRegistryServer registryapi.NetworkServiceEndpointRegistryServer
 
 	nsRegistry := newRemoteNSServer(registryCC)
@@ -86,33 +95,71 @@ func NewServer(ctx context.Context, nsmRegistration *registryapi.NetworkServiceE
 		)
 	}
 
+	nseClient := next.NewNetworkServiceEndpointRegistryClient(
+		querycache.NewClient(ctx),
+		adapter_registry.NetworkServiceEndpointServerToClient(nseRegistry))
+
+	nsClient := adapter_registry.NetworkServiceServerToClient(nsRegistry)
+	var interposeRegistry registryapi.NetworkServiceEndpointRegistryServer
+
 	// Construct Endpoint
 	rv.Endpoint = endpoint.NewServer(ctx,
 		nsmRegistration.Name,
 		authzServer,
 		tokenGenerator,
-		discover.NewServer(adapter_registry.NetworkServiceServerToClient(nsRegistry), adapter_registry.NetworkServiceEndpointServerToClient(nseRegistry)),
-		roundrobin.NewServer(),
-		localbypass.NewServer(&localbypassRegistryServer),
-		excludedprefixes.NewServer(),
-		connect.NewServer(
-			ctx,
-			client.NewClientFactory(nsmRegistration.Name,
-				addressof.NetworkServiceClient(
-					adapters.NewServerToClient(rv)),
-				tokenGenerator),
-			clientDialOptions...),
+		nilFilter(
+			discover.NewServer(nsClient, nseClient),
+			roundrobin.NewServer(),
+			localbypass.NewServer(&localbypassRegistryServer),
+			excludedprefixes.NewServer(ctx),
+			newRecvFD(), // Receive any files passed
+			interpose.NewServer(nsmRegistration.Name, &interposeRegistry),
+			filtermechanisms.NewServer(&urlsRegistryServer),
+			connect.NewServer(
+				ctx,
+				client.NewClientFactory(nsmRegistration.Name,
+					addressof.NetworkServiceClient(
+						adapters.NewServerToClient(rv)),
+					tokenGenerator,
+				),
+				clientDialOptions...),
+		)...,
 	)
 
 	nsChain := chain_registry.NewNetworkServiceRegistryServer(nsRegistry)
 	nseChain := chain_registry.NewNetworkServiceEndpointRegistryServer(
-		localbypassRegistryServer, // Store endpoint Id to EndpointURL for local access.
-		seturl.NewNetworkServiceEndpointRegistryServer(nsmRegistration.Url), // Remember endpoint URL
-		nseRegistry, // Register NSE inside Remote registry with ID assigned
+		nilEndpointFilter(
+			urlsRegistryServer,
+			newRecvFDEndpointRegistry(), // Allow to receive a passed files
+			interposeRegistry,           // Store cross connect NSEs
+			localbypassRegistryServer,   // Store endpoint Id to EndpointURL for local access.
+			seturl.NewNetworkServiceEndpointRegistryServer(nsmRegistration.Url), // Remember endpoint URL
+			nseRegistry, // Register NSE inside Remote registry with ID assigned
+		)...,
 	)
 	rv.Registry = registry.NewServer(nsChain, nseChain)
 
 	return rv
+}
+
+func nilEndpointFilter(servers ...registryapi.NetworkServiceEndpointRegistryServer) []registryapi.NetworkServiceEndpointRegistryServer {
+	result := []registryapi.NetworkServiceEndpointRegistryServer{}
+	for _, s := range servers {
+		if s != nil {
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+func nilFilter(servers ...networkservice.NetworkServiceServer) []networkservice.NetworkServiceServer {
+	result := []networkservice.NetworkServiceServer{}
+	for _, s := range servers {
+		if s != nil {
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 func newRemoteNSServer(cc grpc.ClientConnInterface) registryapi.NetworkServiceRegistryServer {

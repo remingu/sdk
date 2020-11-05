@@ -14,7 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package updatepath provides chain elements to update Connection.Path
+// Package updatepath provides a chain element that sets the id of an incoming or outgoing request
 package updatepath
 
 import (
@@ -24,34 +24,33 @@ import (
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
-	"github.com/networkservicemesh/sdk/pkg/tools/token"
 )
 
 type updatePathServer struct {
-	commonUpdatePath
+	name string
 }
 
-// NewServer - creates a NetworkServiceServer chain element to update the Connection.Path
-//             - name - the name of the NetworkServiceServer of which the chain element is part
-func NewServer(name string, tokenGenerator token.GeneratorFunc) networkservice.NetworkServiceServer {
-	return &updatePathServer{
-		commonUpdatePath{
-			name:           name,
-			tokenGenerator: tokenGenerator,
-		},
+// NewServer - creates a new updatePath client to update connection path.
+//             name - name of the client
+//
+// Workflow are documented in common.go
+func NewServer(name string) networkservice.NetworkServiceServer {
+	return &updatePathServer{name: name}
+}
+
+func (i *updatePathServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (_ *networkservice.Connection, err error) {
+	if request.Connection == nil {
+		request.Connection = &networkservice.Connection{}
 	}
-}
-
-func (u *updatePathServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
-	err := u.updatePath(ctx, request.GetConnection())
+	request.Connection, err = updatePath(request.Connection, i.name)
 	if err != nil {
 		return nil, err
 	}
 	return next.Server(ctx).Request(ctx, request)
 }
 
-func (u *updatePathServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
-	err := u.updatePath(ctx, conn)
+func (i *updatePathServer) Close(ctx context.Context, conn *networkservice.Connection) (_ *empty.Empty, err error) {
+	conn, err = updatePath(conn, i.name)
 	if err != nil {
 		return nil, err
 	}

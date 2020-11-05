@@ -20,17 +20,19 @@ package client
 import (
 	"context"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatetoken"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/utils/inject/injectpeer"
+	"github.com/networkservicemesh/sdk/pkg/tools/addressof"
+
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"google.golang.org/grpc"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/heal"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/refresh"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/setid"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/utils/inject/injectpeer"
 	"github.com/networkservicemesh/sdk/pkg/tools/token"
 )
 
@@ -51,18 +53,23 @@ import (
 //             - cc - grpc.ClientConnInterface for the endpoint to which this client should connect
 //             - additionalFunctionality - any additional NetworkServiceClient chain elements to be included in the chain
 func NewClient(ctx context.Context, name string, onHeal *networkservice.NetworkServiceClient, tokenGenerator token.GeneratorFunc, cc grpc.ClientConnInterface, additionalFunctionality ...networkservice.NetworkServiceClient) networkservice.NetworkServiceClient {
-	return chain.NewNetworkServiceClient(
+	var rv networkservice.NetworkServiceClient
+	if onHeal == nil {
+		onHeal = addressof.NetworkServiceClient(rv)
+	}
+	rv = chain.NewNetworkServiceClient(
 		append(
 			append([]networkservice.NetworkServiceClient{
 				authorize.NewClient(),
-				setid.NewClient(name),
+				updatepath.NewClient(name),
 				heal.NewClient(ctx, networkservice.NewMonitorConnectionClient(cc), onHeal),
 				refresh.NewClient(ctx),
-				injectpeer.NewClient(),
-				updatepath.NewClient(name, tokenGenerator),
 			}, additionalFunctionality...),
+			injectpeer.NewClient(),
+			updatetoken.NewClient(tokenGenerator),
 			networkservice.NewNetworkServiceClient(cc),
 		)...)
+	return rv
 }
 
 // NewClientFactory - returns a func(cc grpc.ClientConnInterface)that returns a  standard Client pieces plus whatever

@@ -18,19 +18,9 @@
 
 package excludedprefixes
 
-// ServerOption - method for excludedPrefixesServer
-type ServerOption func(server *excludedPrefixesServer)
-
-// WithConfigPath - returns method that set configPath in excludedPrefixesServer
-func WithConfigPath(s string) ServerOption {
-	return func(args *excludedPrefixesServer) {
-		args.configPath = s
-	}
-}
-
 func removeDuplicates(elements []string) []string {
 	encountered := map[string]bool{}
-	result := []string{}
+	var result []string
 
 	for index := range elements {
 		if encountered[elements[index]] {

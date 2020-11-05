@@ -22,17 +22,19 @@ import (
 	"io"
 
 	"github.com/golang/protobuf/ptypes/empty"
+	"github.com/google/uuid"
 	"github.com/networkservicemesh/api/pkg/api/registry"
+
+	"github.com/edwarnicke/serialize"
 
 	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
 	"github.com/networkservicemesh/sdk/pkg/tools/matchutils"
-	"github.com/networkservicemesh/sdk/pkg/tools/serialize"
 )
 
 type networkServiceRegistryServer struct {
 	networkServices  NetworkServiceSyncMap
 	executor         serialize.Executor
-	eventChannels    []chan *registry.NetworkService
+	eventChannels    map[string]chan *registry.NetworkService
 	eventChannelSize int
 }
 
@@ -41,7 +43,7 @@ func (n *networkServiceRegistryServer) Register(ctx context.Context, ns *registr
 	if err != nil {
 		return nil, err
 	}
-	n.networkServices.Store(r.Name, r)
+	n.networkServices.Store(r.Name, r.Clone())
 	n.executor.AsyncExec(func() {
 		for _, ch := range n.eventChannels {
 			ch <- r
@@ -55,7 +57,7 @@ func (n *networkServiceRegistryServer) Find(query *registry.NetworkServiceQuery,
 		var err error
 		n.networkServices.Range(func(key string, value *registry.NetworkService) bool {
 			if matchutils.MatchNetworkServices(ns, value) {
-				err = s.Send(value)
+				err = s.Send(value.Clone())
 				return err == nil
 			}
 			return true
@@ -64,13 +66,12 @@ func (n *networkServiceRegistryServer) Find(query *registry.NetworkServiceQuery,
 	}
 	if query.Watch {
 		eventCh := make(chan *registry.NetworkService, n.eventChannelSize)
-		var index int
+		id := uuid.New().String()
 		n.executor.AsyncExec(func() {
-			index = len(n.eventChannels)
-			n.eventChannels = append(n.eventChannels, eventCh)
+			n.eventChannels[id] = eventCh
 		})
 		defer n.executor.AsyncExec(func() {
-			n.eventChannels = append(n.eventChannels[0:index], n.eventChannels[index+1:]...)
+			delete(n.eventChannels, id)
 		})
 		err := sendAllMatches(query.NetworkService)
 		if err != nil {
@@ -118,7 +119,10 @@ func (n *networkServiceRegistryServer) setEventChannelSize(l int) {
 
 // NewNetworkServiceRegistryServer creates new memory based NetworkServiceRegistryServer
 func NewNetworkServiceRegistryServer(options ...Option) registry.NetworkServiceRegistryServer {
-	r := &networkServiceRegistryServer{eventChannelSize: defaultEventChannelSize}
+	r := &networkServiceRegistryServer{
+		eventChannelSize: defaultEventChannelSize,
+		eventChannels:    make(map[string]chan *registry.NetworkService),
+	}
 	for _, o := range options {
 		o.apply(r)
 	}

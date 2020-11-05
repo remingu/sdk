@@ -19,107 +19,302 @@ package nsmgr_test
 
 import (
 	"context"
+	"fmt"
+	"io/ioutil"
 	"net/url"
 	"testing"
 	"time"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/setextracontext"
+	"github.com/golang/protobuf/ptypes/empty"
+	"google.golang.org/grpc"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/adapters"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
+
+	"github.com/sirupsen/logrus"
+
+	"go.uber.org/goleak"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/cls"
 	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
 	"github.com/networkservicemesh/api/pkg/api/registry"
-	"github.com/sirupsen/logrus"
-	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/endpoint"
-
-	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/nsmgr"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/authorize"
-	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
+	"github.com/networkservicemesh/sdk/pkg/tools/sandbox"
 )
 
-func TokenGenerator(peerAuthInfo credentials.AuthInfo) (token string, expireTime time.Time, err error) {
-	return "TestToken", time.Date(3000, 1, 1, 1, 1, 1, 1, time.UTC), nil
-}
-
-func serverNSM(ctx context.Context, listenOn *url.URL, server nsmgr.Nsmgr) (*grpc.Server, context.CancelFunc, <-chan error) {
-	s := grpc.NewServer()
-	server.Register(s)
-
-	cancelCtx, cancel := context.WithCancel(ctx)
-	errorChan := grpcutils.ListenAndServe(cancelCtx, listenOn, s)
-	return s, cancel, errorChan
-}
-
-func newClient(ctx context.Context, u *url.URL) (*grpc.ClientConn, error) {
-	clientCtx, clientCancelFunc := context.WithTimeout(ctx, 10*time.Second)
-	defer clientCancelFunc()
-	return grpc.DialContext(clientCtx, grpcutils.URLToTarget(u),
-		grpc.WithInsecure(),
-		grpc.WithBlock())
-}
-func TestNSmgrEndpointCallback(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func TestNSMGR_RemoteUsecase(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
+	domain := sandbox.NewBuilder(t).
+		SetNodesCount(2).
+		SetRegistryProxySupplier(nil).
+		SetContext(ctx).
+		Build()
+	defer domain.Cleanup()
 
-	// Serve endpoint
-	nseURL := &url.URL{Scheme: "tcp", Host: "127.0.0.1:0"}
-	_ = endpoint.Serve(ctx, nseURL, endpoint.NewServer(ctx, "test-nse", authorize.NewServer(), TokenGenerator, setextracontext.NewServer(map[string]string{"perform": "ok"})))
-	logrus.Infof("NSE listenON: %v", nseURL.String())
-
-	nsmgrReg := &registry.NetworkServiceEndpoint{
-		Name: "nsmgr",
-		Url:  "tcp://127.0.0.1:5001",
+	nseReg := &registry.NetworkServiceEndpoint{
+		Name:                "final-endpoint",
+		NetworkServiceNames: []string{"my-service-remote"},
 	}
 
-	// Server NSMGR, Use in memory registry server
-	mgr := nsmgr.NewServer(ctx, nsmgrReg, authorize.NewServer(), TokenGenerator, nil, grpc.WithInsecure(), grpc.WithDefaultCallOptions(grpc.WaitForReady(true)))
-	nsmURL := &url.URL{Scheme: "tcp", Host: "127.0.0.1:0"}
-	mgrGrpcSrv, mgrGrpcCancel, mgrErr := serverNSM(ctx, nsmURL, mgr)
-	require.NotNil(t, mgrGrpcSrv)
-	require.NotNil(t, mgrErr)
-	defer mgrGrpcCancel()
-	nsmgrReg.Url = nsmURL.String()
-	logrus.Infof("NSMGR listenON: %v", nsmURL.String())
+	_, err := sandbox.NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken, domain.Nodes[0].NSMgr)
+	require.NoError(t, err)
 
-	// Register network service.
-	nsService, err := mgr.NetworkServiceRegistryServer().Register(context.Background(), &registry.NetworkService{
-		Name: "my-service",
-	})
-	require.Nil(t, err)
-
-	// Register Endpoint
-	var nseReg *registry.NetworkServiceEndpoint
-	nseReg, err = mgr.NetworkServiceEndpointRegistryServer().Register(context.Background(), &registry.NetworkServiceEndpoint{
-		NetworkServiceNames: []string{nsService.Name},
-		Url:                 nseURL.String(),
-	})
-	require.Nil(t, err)
-	require.NotEqual(t, "", nseReg.Name)
-	require.NotNil(t, nseReg)
-
-	var nsmClient grpc.ClientConnInterface
-	nsmClient, err = newClient(ctx, nsmURL)
-	require.Nil(t, err)
-	cl := client.NewClient(context.Background(), "nsc-1", nil, TokenGenerator, nsmClient)
-
-	var connection *networkservice.Connection
-
-	connection, err = cl.Request(ctx, &networkservice.NetworkServiceRequest{
+	request := &networkservice.NetworkServiceRequest{
 		MechanismPreferences: []*networkservice.Mechanism{
 			{Cls: cls.LOCAL, Type: kernel.MECHANISM},
 		},
 		Connection: &networkservice.Connection{
 			Id:             "1",
-			NetworkService: "my-service",
+			NetworkService: "my-service-remote",
 			Context:        &networkservice.ConnectionContext{},
 		},
-	})
-	require.Nil(t, err)
-	require.NotNil(t, connection)
-	require.Equal(t, 3, len(connection.Path.PathSegments))
+	}
+
+	nsc, err := sandbox.NewClient(ctx, sandbox.GenerateTestToken, domain.Nodes[1].NSMgr.URL)
+	require.NoError(t, err)
+
+	conn, err := nsc.Request(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	require.Equal(t, 8, len(conn.Path.PathSegments))
+
+	// Simulate refresh from client.
+
+	refreshRequest := request.Clone()
+	refreshRequest.GetConnection().Context = conn.Context
+	refreshRequest.GetConnection().Mechanism = conn.Mechanism
+	refreshRequest.GetConnection().NetworkServiceEndpointName = conn.NetworkServiceEndpointName
+
+	conn, err = nsc.Request(ctx, refreshRequest)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, 8, len(conn.Path.PathSegments))
+}
+
+func TestNSMGR_LocalUsecase(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	domain := sandbox.NewBuilder(t).
+		SetNodesCount(1).
+		SetContext(ctx).
+		SetRegistryProxySupplier(nil).
+		Build()
+	defer domain.Cleanup()
+
+	nseReg := &registry.NetworkServiceEndpoint{
+		Name:                "final-endpoint",
+		NetworkServiceNames: []string{"my-service-remote"},
+	}
+	_, err := sandbox.NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken, domain.Nodes[0].NSMgr)
+	require.NoError(t, err)
+
+	nsc, err := sandbox.NewClient(ctx, sandbox.GenerateTestToken, domain.Nodes[0].NSMgr.URL)
+	require.NoError(t, err)
+
+	request := &networkservice.NetworkServiceRequest{
+		MechanismPreferences: []*networkservice.Mechanism{
+			{Cls: cls.LOCAL, Type: kernel.MECHANISM},
+		},
+		Connection: &networkservice.Connection{
+			Id:             "1",
+			NetworkService: "my-service-remote",
+			Context:        &networkservice.ConnectionContext{},
+		},
+	}
+	conn, err := nsc.Request(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	require.Equal(t, 5, len(conn.Path.PathSegments))
+
+	// Simulate refresh from client.
+
+	refreshRequest := request.Clone()
+	refreshRequest.GetConnection().Context = conn.Context
+	refreshRequest.GetConnection().Mechanism = conn.Mechanism
+	refreshRequest.GetConnection().NetworkServiceEndpointName = conn.NetworkServiceEndpointName
+
+	conn2, err := nsc.Request(ctx, refreshRequest)
+	require.NoError(t, err)
+	require.NotNil(t, conn2)
+	require.Equal(t, 5, len(conn2.Path.PathSegments))
+}
+
+func TestNSMGR_PassThroughRemote(t *testing.T) {
+	nodesCount := 7
+
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	domain := sandbox.NewBuilder(t).
+		SetNodesCount(nodesCount).
+		SetContext(ctx).
+		SetRegistryProxySupplier(nil).
+		Build()
+	defer domain.Cleanup()
+
+	for i := 0; i < nodesCount; i++ {
+		additionalFunctionality := []networkservice.NetworkServiceServer{}
+		if i != 0 {
+			// Passtrough to the node i-1
+			additionalFunctionality = []networkservice.NetworkServiceServer{
+				adapters.NewClientToServer(
+					newPassTroughClient(
+						[]*networkservice.Mechanism{
+							{Cls: cls.LOCAL, Type: kernel.MECHANISM},
+						},
+						fmt.Sprintf("my-service-remote-%v", i-1),
+						fmt.Sprintf("endpoint-%v", i-1),
+						domain.Nodes[i].NSMgr.URL)),
+			}
+		}
+		nseReg := &registry.NetworkServiceEndpoint{
+			Name:                fmt.Sprintf("endpoint-%v", i),
+			NetworkServiceNames: []string{fmt.Sprintf("my-service-remote-%v", i)},
+		}
+		_, err := sandbox.NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken, domain.Nodes[i].NSMgr, additionalFunctionality...)
+		require.NoError(t, err)
+	}
+
+	nsc, err := sandbox.NewClient(ctx, sandbox.GenerateTestToken, domain.Nodes[nodesCount-1].NSMgr.URL)
+	require.NoError(t, err)
+
+	request := &networkservice.NetworkServiceRequest{
+		MechanismPreferences: []*networkservice.Mechanism{
+			{Cls: cls.LOCAL, Type: kernel.MECHANISM},
+		},
+		Connection: &networkservice.Connection{
+			Id:             "1",
+			NetworkService: fmt.Sprintf("my-service-remote-%v", nodesCount-1),
+			Context:        &networkservice.ConnectionContext{},
+		},
+	}
+
+	conn, err := nsc.Request(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// Path length to first endpoint is 5
+	// Path length from NSE client to other remote endpoint is 8
+	require.Equal(t, 8*(nodesCount-1)+5, len(conn.Path.PathSegments))
+}
+
+func TestNSMGR_PassThroughLocal(t *testing.T) {
+	nsesCount := 7
+
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	logrus.SetOutput(ioutil.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	domain := sandbox.NewBuilder(t).
+		SetNodesCount(1).
+		SetContext(ctx).
+		SetRegistryProxySupplier(nil).
+		Build()
+	defer domain.Cleanup()
+
+	for i := 0; i < nsesCount; i++ {
+		additionalFunctionality := []networkservice.NetworkServiceServer{}
+		if i != 0 {
+			additionalFunctionality = []networkservice.NetworkServiceServer{
+				adapters.NewClientToServer(
+					newPassTroughClient(
+						[]*networkservice.Mechanism{
+							{Cls: cls.LOCAL, Type: kernel.MECHANISM},
+						},
+						fmt.Sprintf("my-service-remote-%v", i-1),
+						fmt.Sprintf("endpoint-%v", i-1),
+						domain.Nodes[0].NSMgr.URL)),
+			}
+		}
+		nseReg := &registry.NetworkServiceEndpoint{
+			Name:                fmt.Sprintf("endpoint-%v", i),
+			NetworkServiceNames: []string{fmt.Sprintf("my-service-remote-%v", i)},
+		}
+		_, err := sandbox.NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken, domain.Nodes[0].NSMgr, additionalFunctionality...)
+		require.NoError(t, err)
+	}
+
+	nsc, err := sandbox.NewClient(ctx, sandbox.GenerateTestToken, domain.Nodes[0].NSMgr.URL)
+	require.NoError(t, err)
+
+	request := &networkservice.NetworkServiceRequest{
+		MechanismPreferences: []*networkservice.Mechanism{
+			{Cls: cls.LOCAL, Type: kernel.MECHANISM},
+		},
+		Connection: &networkservice.Connection{
+			Id:             "1",
+			NetworkService: fmt.Sprintf("my-service-remote-%v", nsesCount-1),
+			Context:        &networkservice.ConnectionContext{},
+		},
+	}
+
+	conn, err := nsc.Request(ctx, request)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// Path length to first endpoint is 5
+	// Path length from NSE client to other local endpoint is 5
+	require.Equal(t, 5*(nsesCount-1)+5, len(conn.Path.PathSegments))
+}
+
+type passThroughClient struct {
+	mechanismPreferences       []*networkservice.Mechanism
+	networkService             string
+	networkServiceEndpointName string
+	connectTo                  *url.URL
+}
+
+func newPassTroughClient(mechanismPreferences []*networkservice.Mechanism, networkService, networkServiceEndpointName string, connectTo *url.URL) *passThroughClient {
+	return &passThroughClient{
+		mechanismPreferences:       mechanismPreferences,
+		networkService:             networkService,
+		networkServiceEndpointName: networkServiceEndpointName,
+		connectTo:                  connectTo,
+	}
+}
+
+func (p *passThroughClient) Request(ctx context.Context, request *networkservice.NetworkServiceRequest, opts ...grpc.CallOption) (*networkservice.Connection, error) {
+	newCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	nsc, err := sandbox.NewClient(
+		newCtx, sandbox.GenerateTestToken, p.connectTo,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	newRequest := &networkservice.NetworkServiceRequest{
+		MechanismPreferences: p.mechanismPreferences,
+		Connection: &networkservice.Connection{
+			NetworkService:             p.networkService,
+			NetworkServiceEndpointName: p.networkServiceEndpointName,
+			Context:                    &networkservice.ConnectionContext{},
+		},
+	}
+	conn, err := nsc.Request(newCtx, newRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	request.Connection.Path.Index += conn.Path.Index
+	request.Connection.Path.PathSegments = append(request.Connection.Path.PathSegments, conn.Path.PathSegments...)
+
+	return next.Client(ctx).Request(ctx, request, opts...)
+}
+
+func (p *passThroughClient) Close(ctx context.Context, conn *networkservice.Connection, opts ...grpc.CallOption) (*empty.Empty, error) {
+	conn = conn.Clone()
+	return next.Client(ctx).Close(ctx, conn, opts...)
 }

@@ -30,13 +30,12 @@ import (
 )
 
 type refreshNSEClient struct {
-	client                registry.NetworkServiceEndpointRegistryClient
-	nseCancelers          cancelersMap
+	nseCancels            cancelsMap
 	retryDelay            time.Duration
 	defaultExpiryDuration time.Duration
 }
 
-func (c *refreshNSEClient) startRefresh(ctx context.Context, nse *registry.NetworkServiceEndpoint) {
+func (c *refreshNSEClient) startRefresh(ctx context.Context, client registry.NetworkServiceEndpointRegistryClient, nse *registry.NetworkServiceEndpoint) {
 	t := time.Unix(nse.ExpirationTime.Seconds, int64(nse.ExpirationTime.Nanos))
 	delta := time.Until(t)
 	go func() {
@@ -49,7 +48,7 @@ func (c *refreshNSEClient) startRefresh(ctx context.Context, nse *registry.Netwo
 				nse.ExpirationTime.Seconds = t1.Unix()
 				nse.ExpirationTime.Nanos = int32(t1.Nanosecond())
 				var err error
-				nse, err = c.client.Register(ctx, nse)
+				nse, err = client.Register(ctx, nse)
 				if err != nil {
 					<-time.After(c.retryDelay)
 					continue
@@ -68,16 +67,17 @@ func (c *refreshNSEClient) Register(ctx context.Context, in *registry.NetworkSer
 			Nanos:   int32(expirationTime.Nanosecond()),
 		}
 	}
-	resp, err := next.NetworkServiceEndpointRegistryClient(ctx).Register(ctx, in, opts...)
+	nextClient := next.NetworkServiceEndpointRegistryClient(ctx)
+	resp, err := nextClient.Register(ctx, in, opts...)
 	if err != nil {
 		return nil, err
 	}
-	if cancel, ok := c.nseCancelers.Load(resp.Name); ok {
+	if cancel, ok := c.nseCancels.Load(resp.Name); ok {
 		cancel()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c.nseCancelers.Store(resp.Name, cancel)
-	c.startRefresh(ctx, resp)
+	c.nseCancels.Store(resp.Name, cancel)
+	c.startRefresh(ctx, nextClient, resp)
 	return resp, err
 }
 
@@ -90,17 +90,16 @@ func (c *refreshNSEClient) Unregister(ctx context.Context, in *registry.NetworkS
 	if err != nil {
 		return nil, err
 	}
-	if cancel, ok := c.nseCancelers.Load(in.Name); ok {
+	if cancel, ok := c.nseCancels.Load(in.Name); ok {
 		cancel()
 	}
-	c.nseCancelers.Delete(in.Name)
+	c.nseCancels.Delete(in.Name)
 	return resp, nil
 }
 
 // NewNetworkServiceEndpointRegistryClient creates new NetworkServiceEndpointRegistryClient that will refresh expiration time for registered NSEs
-func NewNetworkServiceEndpointRegistryClient(client registry.NetworkServiceEndpointRegistryClient, options ...Option) registry.NetworkServiceEndpointRegistryClient {
+func NewNetworkServiceEndpointRegistryClient(options ...Option) registry.NetworkServiceEndpointRegistryClient {
 	c := &refreshNSEClient{
-		client:                client,
 		retryDelay:            time.Second * 5,
 		defaultExpiryDuration: time.Minute * 30,
 	}

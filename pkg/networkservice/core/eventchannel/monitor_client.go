@@ -28,7 +28,7 @@ import (
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"google.golang.org/grpc"
 
-	"github.com/networkservicemesh/sdk/pkg/tools/serialize"
+	"github.com/edwarnicke/serialize"
 )
 
 type monitorConnectionClient struct {
@@ -72,7 +72,7 @@ func (m *monitorConnectionClient) MonitorConnections(ctx context.Context, _ *net
 			})
 		}()
 	})
-	return NewMonitorConnectionMonitorConnectionsClient(fanoutEventCh), nil
+	return NewMonitorConnectionMonitorConnectionsClient(ctx, fanoutEventCh), nil
 }
 
 func (m *monitorConnectionClient) eventLoop() {

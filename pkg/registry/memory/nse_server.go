@@ -21,20 +21,23 @@ import (
 	"errors"
 	"io"
 
+	"github.com/google/uuid"
+
 	"github.com/golang/protobuf/ptypes/timestamp"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/networkservicemesh/api/pkg/api/registry"
 
+	"github.com/edwarnicke/serialize"
+
 	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
 	"github.com/networkservicemesh/sdk/pkg/tools/matchutils"
-	"github.com/networkservicemesh/sdk/pkg/tools/serialize"
 )
 
 type networkServiceEndpointRegistryServer struct {
 	networkServiceEndpoints NetworkServiceEndpointSyncMap
 	executor                serialize.Executor
-	eventChannels           []chan *registry.NetworkServiceEndpoint
+	eventChannels           map[string]chan *registry.NetworkServiceEndpoint
 	eventChannelSize        int
 }
 
@@ -43,7 +46,7 @@ func (n *networkServiceEndpointRegistryServer) Register(ctx context.Context, nse
 	if err != nil {
 		return nil, err
 	}
-	n.networkServiceEndpoints.Store(r.Name, r)
+	n.networkServiceEndpoints.Store(r.Name, r.Clone())
 	n.sendEvent(r)
 	return r, err
 }
@@ -53,7 +56,7 @@ func (n *networkServiceEndpointRegistryServer) Find(query *registry.NetworkServi
 		var err error
 		n.networkServiceEndpoints.Range(func(key string, value *registry.NetworkServiceEndpoint) bool {
 			if matchutils.MatchNetworkServiceEndpoints(ns, value) {
-				err = s.Send(value)
+				err = s.Send(value.Clone())
 				return err == nil
 			}
 			return true
@@ -62,13 +65,12 @@ func (n *networkServiceEndpointRegistryServer) Find(query *registry.NetworkServi
 	}
 	if query.Watch {
 		eventCh := make(chan *registry.NetworkServiceEndpoint, n.eventChannelSize)
-		var index int
+		id := uuid.New().String()
 		n.executor.AsyncExec(func() {
-			index = len(n.eventChannels)
-			n.eventChannels = append(n.eventChannels, eventCh)
+			n.eventChannels[id] = eventCh
 		})
 		defer n.executor.AsyncExec(func() {
-			n.eventChannels = append(n.eventChannels[0:index], n.eventChannels[index+1:]...)
+			delete(n.eventChannels, id)
 		})
 		err := sendAllMatches(query.NetworkServiceEndpoint)
 		if err != nil {
@@ -110,7 +112,9 @@ func (n *networkServiceEndpointRegistryServer) Unregister(ctx context.Context, n
 	if nse.ExpirationTime == nil {
 		nse.ExpirationTime = &timestamp.Timestamp{}
 	}
-	nse.ExpirationTime.Seconds = -1
+	<-n.executor.AsyncExec(func() {
+		nse.ExpirationTime.Seconds = -1
+	})
 	n.sendEvent(nse)
 	return next.NetworkServiceEndpointRegistryServer(ctx).Unregister(ctx, nse)
 }
@@ -129,7 +133,10 @@ func (n *networkServiceEndpointRegistryServer) sendEvent(nse *registry.NetworkSe
 
 // NewNetworkServiceEndpointRegistryServer creates new memory based NetworkServiceEndpointRegistryServer
 func NewNetworkServiceEndpointRegistryServer(options ...Option) registry.NetworkServiceEndpointRegistryServer {
-	r := &networkServiceEndpointRegistryServer{eventChannelSize: defaultEventChannelSize}
+	r := &networkServiceEndpointRegistryServer{
+		eventChannelSize: defaultEventChannelSize,
+		eventChannels:    make(map[string]chan *registry.NetworkServiceEndpoint),
+	}
 	for _, o := range options {
 		o.apply(r)
 	}

@@ -27,10 +27,11 @@ import (
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"google.golang.org/grpc"
 
+	"github.com/edwarnicke/serialize"
+
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/trace"
 	"github.com/networkservicemesh/sdk/pkg/tools/extend"
-	"github.com/networkservicemesh/sdk/pkg/tools/serialize"
 )
 
 type refreshClient struct {
@@ -56,16 +57,14 @@ func (t *refreshClient) Request(ctx context.Context, request *networkservice.Net
 	if err != nil {
 		return nil, err
 	}
-	expireTime, err := ptypes.Timestamp(request.GetConnection().GetPath().GetPathSegments()[request.GetConnection().GetPath().GetIndex()].GetExpires())
+	expireTime, err := ptypes.Timestamp(rv.GetPath().GetPathSegments()[request.GetConnection().GetPath().GetIndex()].GetExpires())
 	if err != nil {
 		return nil, err
 	}
 
 	// Create refreshRequest
 	refreshRequest := request.Clone()
-	refreshRequest.GetConnection().Context = rv.Context
-	refreshRequest.GetConnection().Mechanism = rv.Mechanism
-	refreshRequest.GetConnection().NetworkServiceEndpointName = rv.NetworkServiceEndpointName
+	refreshRequest.Connection = rv.Clone()
 
 	// TODO - introduce random noise into duration avoid timer lock
 	duration := time.Until(expireTime) / 3
@@ -77,8 +76,10 @@ func (t *refreshClient) Request(ctx context.Context, request *networkservice.Net
 			refreshCtx, cancel = context.WithDeadline(refreshCtx, deadline.Add(duration))
 		}
 
+		connID := refreshRequest.GetConnection().GetId()
+
 		// Stop any existing timers
-		if timer, ok := t.timers[request.GetConnection().GetId()]; ok {
+		if timer, ok := t.timers[connID]; ok {
 			timer.Stop()
 		}
 
@@ -87,7 +88,7 @@ func (t *refreshClient) Request(ctx context.Context, request *networkservice.Net
 		timer = time.AfterFunc(duration, func() {
 			<-t.executor.AsyncExec(func() {
 				// Check to see if we've been superseded by another timer, if so, do nothing
-				currentTimer, ok := t.timers[refreshRequest.GetConnection().GetId()]
+				currentTimer, ok := t.timers[connID]
 				if ok && currentTimer != timer {
 					cancel()
 					return
@@ -100,14 +101,14 @@ func (t *refreshClient) Request(ctx context.Context, request *networkservice.Net
 			default:
 				if _, err := t.Request(refreshCtx, refreshRequest, opts...); err != nil {
 					// TODO - do we want to retry at 2/3 and 3/3 if we fail here?
-					trace.Log(refreshCtx).Errorf("Error while attempting to refresh connection %s: %+v", request.GetConnection().GetId(), err)
+					trace.Log(refreshCtx).Errorf("Error while attempting to refresh connection %s: %+v", connID, err)
 				}
 			}
 			// Set timer to nil to be really really sure we don't have a circular reference that precludes garbage collection
 			timer = nil
 		})
-		t.timers[request.GetConnection().GetId()] = timer
-		t.cancels[request.GetConnection().GetId()] = cancel
+		t.timers[connID] = timer
+		t.cancels[connID] = cancel
 	})
 	return rv, nil
 }

@@ -20,9 +20,6 @@ package prefixpool_test
 
 import (
 	"net"
-	"os"
-	"path"
-	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -34,6 +31,16 @@ import (
 	"github.com/networkservicemesh/sdk/pkg/tools/prefixpool"
 )
 
+func TestEmptryPrefixPoolIsNotPanics(t *testing.T) {
+	var p *prefixpool.PrefixPool
+	var err error
+	require.NotPanics(t, func() {
+		p, err = prefixpool.New()
+	})
+	require.Nil(t, err)
+	require.NotNil(t, p)
+}
+
 func TestNetExtractIPv4(t *testing.T) {
 	testNetExtract(t, "10.10.1.0/24", "10.10.1.1/30", "10.10.1.2/30", networkservice.IpFamily_IPV4)
 }
@@ -43,7 +50,7 @@ func TestNetExtractIPv6(t *testing.T) {
 }
 
 func testNetExtract(t *testing.T, inPool, srcDesired, dstDesired string, family networkservice.IpFamily_Family) {
-	pool, err := prefixpool.NewPrefixPool(inPool)
+	pool, err := prefixpool.New(inPool)
 	require.Nil(t, err)
 
 	srcIP, dstIP, requested, err := pool.Extract("c1", family)
@@ -88,7 +95,7 @@ func TestExtractPrefixes_1_ipv6(t *testing.T) {
 }
 
 func TestIntersect1(t *testing.T) {
-	pp, err := prefixpool.NewPrefixPool("10.10.1.0/24")
+	pp, err := prefixpool.New("10.10.1.0/24")
 	require.Nil(t, err)
 
 	x, _ := pp.Intersect("10.10.1.0/28")
@@ -106,7 +113,7 @@ func TestIntersect1(t *testing.T) {
 }
 
 func TestIntersect2(t *testing.T) {
-	pp, err := prefixpool.NewPrefixPool("10.10.1.0/24", "10.32.1.0/16")
+	pp, err := prefixpool.New("10.10.1.0/24", "10.32.1.0/16")
 	require.Nil(t, err)
 
 	x, _ := pp.Intersect("10.10.1.0/28")
@@ -126,7 +133,7 @@ func TestIntersect2(t *testing.T) {
 }
 
 func TestReleaseExcludePrefixes(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.20.1.10/24", "10.20.32.0/19"}
 
@@ -140,8 +147,24 @@ func TestReleaseExcludePrefixes(t *testing.T) {
 	require.Equal(t, []string{"10.20.0.0/16"}, pool.GetPrefixes())
 }
 
+func TestReleaseExcludePrefixesNestedNetworks(t *testing.T) {
+	pool, err := prefixpool.New("10.20.4.1/22", "127.0.0.1/22")
+	require.Nil(t, err)
+
+	expectedPrefixes := []string{"10.20.0.0/16", "127.0.0.0/22"}
+	prefixesToRelease := []string{"10.20.0.1/21", "10.20.2.1/21", "10.20.2.1/16"}
+
+	err = pool.ReleaseExcludedPrefixes(prefixesToRelease)
+	require.Nil(t, err)
+	require.Equal(t, expectedPrefixes, pool.GetPrefixes())
+
+	err = pool.ReleaseExcludedPrefixes(prefixesToRelease)
+	require.Nil(t, err)
+	require.Equal(t, expectedPrefixes, pool.GetPrefixes())
+}
+
 func TestReleaseExcludePrefixesNoOverlap(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.32.0.0/16"}
 
@@ -156,7 +179,7 @@ func TestReleaseExcludePrefixesNoOverlap(t *testing.T) {
 }
 
 func TestReleaseExcludePrefixesFullOverlap(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16", "2.20.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16", "2.20.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"2.20.0.0/8"}
 
@@ -171,7 +194,7 @@ func TestReleaseExcludePrefixesFullOverlap(t *testing.T) {
 }
 
 func TestExcludePrefixesPartialOverlap(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16", "10.32.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16", "10.32.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.20.1.10/24", "10.20.32.0/19"}
 
@@ -182,7 +205,7 @@ func TestExcludePrefixesPartialOverlap(t *testing.T) {
 }
 
 func TestExcludePrefixesPartialOverlapSmallNetworks(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.20.1.0/30", "10.20.10.0/30", "10.20.20.0/30", "10.20.20.20/30", "10.20.40.20/30"}
 
@@ -193,7 +216,7 @@ func TestExcludePrefixesPartialOverlapSmallNetworks(t *testing.T) {
 }
 
 func TestExcludePrefixesNoOverlap(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/16")
+	pool, err := prefixpool.New("10.20.0.0/16")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.32.1.0/16"}
 
@@ -204,7 +227,7 @@ func TestExcludePrefixesNoOverlap(t *testing.T) {
 }
 
 func TestExcludePrefixesFullOverlap(t *testing.T) {
-	pool, err := prefixpool.NewPrefixPool("10.20.0.0/24")
+	pool, err := prefixpool.New("10.20.0.0/24")
 	require.Nil(t, err)
 	excludedPrefix := []string{"10.20.1.0/16"}
 
@@ -214,28 +237,10 @@ func TestExcludePrefixesFullOverlap(t *testing.T) {
 }
 
 func TestPrefixPoolValidation(t *testing.T) {
-	_, err := prefixpool.NewPrefixPool("10.20.0.0/24")
+	_, err := prefixpool.New("10.20.0.0/24")
 	require.Nil(t, err)
-	_, err = prefixpool.NewPrefixPool("10.20.0.0/56")
+	_, err = prefixpool.New("10.20.0.0/56")
 	if assert.Error(t, err) {
 		require.Equal(t, &net.ParseError{Type: "CIDR address", Text: "10.20.0.0/56"}, err)
 	}
-}
-
-func TestNewPrefixPoolReader(t *testing.T) {
-	prefixes := []string{"172.16.1.0/24", "10.32.0.0/12", "10.96.0.0/12"}
-	testConfig := strings.Join(append([]string{"prefixes:"}, prefixes...), "\n- ")
-
-	configPath := path.Join(os.TempDir(), "excluded_prefixes.yaml")
-	f, err := os.Create(configPath)
-	require.Nil(t, err)
-	defer func() { _ = os.Remove(configPath) }()
-	_, err = f.WriteString(testConfig)
-	require.Nil(t, err)
-	err = f.Close()
-	require.Nil(t, err)
-
-	prefixPool := prefixpool.NewPrefixPoolReader(configPath)
-
-	require.Equal(t, prefixPool.GetPrefixes(), prefixes)
 }

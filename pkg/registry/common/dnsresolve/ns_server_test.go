@@ -18,14 +18,16 @@ package dnsresolve_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
+
+	"github.com/networkservicemesh/sdk/pkg/tools/clienturlctx"
 
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/networkservicemesh/api/pkg/api/registry"
 	"github.com/stretchr/testify/require"
 
-	"github.com/networkservicemesh/sdk/pkg/registry/common/clienturl"
 	"github.com/networkservicemesh/sdk/pkg/registry/common/dnsresolve"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/streamchannel"
@@ -34,32 +36,33 @@ import (
 type checkNSContext struct{ *testing.T }
 
 func (c *checkNSContext) Register(ctx context.Context, ns *registry.NetworkService) (*registry.NetworkService, error) {
-	require.NotNil(c, clienturl.ClientURL(ctx))
+	require.NotNil(c, clienturlctx.ClientURL(ctx))
 	return next.NetworkServiceRegistryServer(ctx).Register(ctx, ns)
 }
 
 func (c *checkNSContext) Find(q *registry.NetworkServiceQuery, s registry.NetworkServiceRegistry_FindServer) error {
-	require.NotNil(c, clienturl.ClientURL(s.Context()))
+	require.NotNil(c, clienturlctx.ClientURL(s.Context()))
 	return next.NetworkServiceRegistryServer(s.Context()).Find(q, s)
 }
 
 func (c *checkNSContext) Unregister(ctx context.Context, ns *registry.NetworkService) (*empty.Empty, error) {
-	require.NotNil(c, clienturl.ClientURL(ctx))
+	require.NotNil(c, clienturlctx.ClientURL(ctx))
 	return next.NetworkServiceRegistryServer(ctx).Unregister(ctx, ns)
 }
 
 func TestDNSResolve_NewNetworkServiceRegistryServer(t *testing.T) {
+	const srv = "service1"
 	s := dnsresolve.NewNetworkServiceRegistryServer(
-		dnsresolve.WithService("service1"),
+		dnsresolve.WithService(srv),
 		dnsresolve.WithResolver(&testResolver{
 			srvRecords: map[string][]*net.SRV{
-				"_service1._tcp.domain1": {{
+				fmt.Sprintf("_%v._tcp.%v.domain1", srv, srv): {{
 					Port:   80,
 					Target: "domain1",
 				}},
 			},
 			hostRecords: map[string][]net.IPAddr{
-				"domain1": {{
+				fmt.Sprintf("%v.domain1", srv): {{
 					IP: net.ParseIP("127.0.0.1"),
 				}},
 			},
@@ -80,13 +83,13 @@ func TestDNSResolveDefault_NewNetworkServiceRegistryServer(t *testing.T) {
 	s := dnsresolve.NewNetworkServiceRegistryServer(
 		dnsresolve.WithResolver(&testResolver{
 			srvRecords: map[string][]*net.SRV{
-				"_" + dnsresolve.NSMRegistryService + "._tcp.domain1": {{
+				fmt.Sprintf("_%v._tcp.%v.domain1", dnsresolve.NSMRegistryService, dnsresolve.NSMRegistryService): {{
 					Port:   80,
 					Target: "domain1",
 				}},
 			},
 			hostRecords: map[string][]net.IPAddr{
-				"domain1": {{
+				dnsresolve.NSMRegistryService + ".domain1": {{
 					IP: net.ParseIP("127.0.0.1"),
 				}},
 			},

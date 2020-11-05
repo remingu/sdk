@@ -23,13 +23,15 @@ import (
 	"context"
 	"net/url"
 
-	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"google.golang.org/grpc"
+
+	"github.com/networkservicemesh/api/pkg/api/networkservice"
+
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatetoken"
 
 	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/monitor"
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/setid"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/timeout"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/updatepath"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/chain"
@@ -59,14 +61,16 @@ type endpoint struct {
 //             - additionalFunctionality - any additional NetworkServiceServer chain elements to be included in the chain
 func NewServer(ctx context.Context, name string, authzServer networkservice.NetworkServiceServer, tokenGenerator token.GeneratorFunc, additionalFunctionality ...networkservice.NetworkServiceServer) Endpoint {
 	rv := &endpoint{}
-	var ns networkservice.NetworkServiceServer = rv
 	rv.NetworkServiceServer = chain.NewNetworkServiceServer(
 		append([]networkservice.NetworkServiceServer{
 			authzServer,
-			setid.NewServer(name),
+			updatepath.NewServer(name),
+			// `timeout` uses ctx as a context for the timeout Close and it closes only the subsequent chain, so
+			// chain elements before the `timeout` in chain shouldn't make any updates to the Close context and
+			// shouldn't be closed on Connection Close.
+			timeout.NewServer(ctx),
 			monitor.NewServer(ctx, &rv.MonitorConnectionServer),
-			timeout.NewServer(&ns),
-			updatepath.NewServer(name, tokenGenerator),
+			updatetoken.NewServer(tokenGenerator),
 		}, additionalFunctionality...)...)
 	return rv
 }

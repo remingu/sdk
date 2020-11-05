@@ -29,11 +29,10 @@ const (
 	logKey contextKeyType = "Log"
 )
 
-// withLog -
-//   Provides a FieldLogger in context
+// withLog - Provides a FieldLogger in context
 func withLog(parent context.Context, log logrus.FieldLogger) context.Context {
 	if parent == nil {
-		parent = context.TODO()
+		panic("cannot create context from nil parent")
 	}
 	return context.WithValue(parent, logKey, log)
 }
