@@ -1,6 +1,6 @@
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
-//
 // Copyright (c) 2020 Cisco Systems, Inc.
+//
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -23,21 +23,20 @@ import (
 	"context"
 	"time"
 
-	"github.com/edwarnicke/serialize"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
 
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/serialize"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 	"github.com/networkservicemesh/sdk/pkg/tools/log"
 )
 
 type timeoutServer struct {
-	ctx       context.Context
-	timers    timerMap
-	executors executorMap
+	ctx    context.Context
+	timers timerMap
 }
 
 // NewServer - creates a new NetworkServiceServer chain element that implements timeout of expired connections
@@ -50,46 +49,8 @@ func NewServer(ctx context.Context) networkservice.NetworkServiceServer {
 	}
 }
 
-func (t *timeoutServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (conn *networkservice.Connection, err error) {
-	connID := request.GetConnection().GetId()
-
-	newExecutor := new(serialize.Executor)
-	// If we create an executor, we should be the first one who uses it, or else we can get a double Close issue:
-	//     1. timeout close ->  : closing the Connection
-	//     2. request ->        : creating `newExecutor`, storing into `executors`
-	//     3. close ->          : locking `newExecutor`, checking `newExecutor == executors[connID]` - looks like
-	//                            a retry Close case (but it isn't), double closing the Connection
-	<-newExecutor.AsyncExec(func() {
-		executor, loaded := t.executors.LoadOrStore(connID, newExecutor)
-		if loaded {
-			<-executor.AsyncExec(func() {
-				// Executor has been possibly removed by `t.close()` at this moment, we need to store it back.
-				exec, _ := t.executors.LoadOrStore(connID, executor)
-				if exec != executor {
-					// It can happen in such situation:
-					//     1. -> timeout close  : locking `executor`
-					//     2. -> request-1      : waiting on `executor`
-					//     3. timeout close ->  : unlocking `executor`, removing it from `executors`
-					//     4. -> request-2      : creating `exec`, storing into `executors`, locking `exec`
-					//     5. -request-1->      : locking `executor`, trying to store it into `executors`
-					// at 5. we get `request-1` locking `executor`, `request-2` locking `exec` and only `exec` stored
-					// in `executors`. It means that `request-2` and all subsequent events will be executed in parallel
-					// with `request-1`.
-					err = errors.Errorf("race condition, parallel request execution: %v", connID)
-					return
-				}
-				conn, err = t.request(ctx, request, executor)
-			})
-		} else {
-			conn, err = t.request(ctx, request, executor)
-		}
-	})
-
-	return conn, err
-}
-
-func (t *timeoutServer) request(ctx context.Context, request *networkservice.NetworkServiceRequest, executor *serialize.Executor) (*networkservice.Connection, error) {
-	logEntry := log.Entry(ctx).WithField("timeoutServer", "request")
+func (t *timeoutServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
+	logger := log.FromContext(ctx).WithField("timeoutServer", "request")
 
 	connID := request.GetConnection().GetId()
 
@@ -100,7 +61,7 @@ func (t *timeoutServer) request(ctx context.Context, request *networkservice.Net
 			// Since timer is being deleted under the `executor.AsyncExec()` this can't be a situation when
 			// the Request is executing after the timeout Close. Such case cannot be distinguished with the
 			// first-request case.
-			logEntry.Warnf("connection has been timed out, re requesting: %v", connID)
+			logger.Warnf("connection has been timed out, re requesting: %v", connID)
 		}
 	}
 
@@ -109,7 +70,7 @@ func (t *timeoutServer) request(ctx context.Context, request *networkservice.Net
 		return nil, err
 	}
 
-	timer, err := t.createTimer(ctx, conn, executor)
+	timer, err := t.createTimer(ctx, conn)
 	if err != nil {
 		if _, closeErr := next.Server(ctx).Close(ctx, conn); closeErr != nil {
 			err = errors.Wrapf(err, "error attempting to close failed connection %v: %+v", connID, closeErr)
@@ -122,10 +83,18 @@ func (t *timeoutServer) request(ctx context.Context, request *networkservice.Net
 	return conn, nil
 }
 
-func (t *timeoutServer) createTimer(ctx context.Context, conn *networkservice.Connection, executor *serialize.Executor) (*time.Timer, error) {
-	logEntry := log.Entry(ctx).WithField("timeoutServer", "createTimer")
+func (t *timeoutServer) createTimer(ctx context.Context, conn *networkservice.Connection) (*time.Timer, error) {
+	logger := log.FromContext(ctx).WithField("timeoutServer", "createTimer")
 
-	expireTime, err := ptypes.Timestamp(conn.GetPath().GetPathSegments()[conn.GetPath().GetIndex()-1].GetExpires())
+	executor := serialize.GetExecutor(ctx)
+	if executor == nil {
+		return nil, errors.New("no executor provided")
+	}
+
+	if conn.GetPrevPathSegment().GetExpires() == nil {
+		return nil, errors.Errorf("expiration for prev path segment cannot be nil. conn: %+v", conn)
+	}
+	expireTime, err := ptypes.Timestamp(conn.GetPrevPathSegment().GetExpires())
 	if err != nil {
 		return nil, err
 	}
@@ -134,13 +103,14 @@ func (t *timeoutServer) createTimer(ctx context.Context, conn *networkservice.Co
 
 	timerPtr := new(*time.Timer)
 	*timerPtr = time.AfterFunc(time.Until(expireTime), func() {
-		executor.AsyncExec(func() {
-			if timer, ok := t.timers.Load(conn.GetId()); !ok || timer != *timerPtr {
-				logEntry.Warnf("timer has been already stopped: %v", conn.GetId())
+		<-executor.AsyncExec(func() {
+			if timer, _ := t.timers.Load(conn.GetId()); timer != *timerPtr {
+				logger.Warnf("timer has been already stopped: %v", conn.GetId())
 				return
 			}
-			if err := t.close(t.ctx, conn, next.Server(ctx)); err != nil {
-				logEntry.Errorf("failed to close timed out connection: %v %+v", conn.GetId(), err)
+			t.timers.Delete(conn.GetId())
+			if _, err := next.Server(ctx).Close(t.ctx, conn); err != nil {
+				logger.Errorf("failed to close timed out connection: %v %+v", conn.GetId(), err)
 			}
 		})
 	})
@@ -148,45 +118,15 @@ func (t *timeoutServer) createTimer(ctx context.Context, conn *networkservice.Co
 	return *timerPtr, nil
 }
 
-func (t *timeoutServer) Close(ctx context.Context, conn *networkservice.Connection) (_ *empty.Empty, err error) {
-	logEntry := log.Entry(ctx).WithField("timeoutServer", "Close")
-
-	executor, ok := t.executors.Load(conn.GetId())
-	if ok {
-		<-executor.AsyncExec(func() {
-			var exec *serialize.Executor
-			if exec, ok = t.executors.Load(conn.GetId()); ok && exec == executor {
-				err = t.close(ctx, conn, next.Server(ctx))
-			} else {
-				ok = false
-			}
-		})
-	}
-	if !ok {
-		logEntry.Warnf("connection has been already closed: %v", conn.GetId())
-		return &empty.Empty{}, nil
-	}
-
-	return &empty.Empty{}, err
-}
-
-func (t *timeoutServer) close(ctx context.Context, conn *networkservice.Connection, nextServer networkservice.NetworkServiceServer) error {
-	logEntry := log.Entry(ctx).WithField("timeoutServer", "close")
+func (t *timeoutServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
+	logger := log.FromContext(ctx).WithField("timeoutServer", "close")
 
 	timer, ok := t.timers.LoadAndDelete(conn.GetId())
-	if ok {
-		timer.Stop()
-	} else {
-		// Last time we failed to close the Connection, let's do it again.
-		logEntry.Warnf("retrying to close the connection: %v", conn.GetId())
+	if !ok {
+		logger.Warnf("connection has been already closed: %v", conn.GetId())
+		return new(empty.Empty), nil
 	}
+	timer.Stop()
 
-	_, err := nextServer.Close(ctx, conn)
-	if err == nil {
-		// If `nextServer.Close()` returns an error, the Connection is not truly closed, so we don't want to delete
-		// the related executor.
-		t.executors.Delete(conn.GetId())
-	}
-
-	return err
+	return next.Server(ctx).Close(ctx, conn)
 }

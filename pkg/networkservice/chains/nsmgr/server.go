@@ -1,6 +1,6 @@
-// Copyright (c) 2020 Cisco and/or its affiliates.
+// Copyright (c) 2020-2021 Cisco and/or its affiliates.
 //
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,7 +21,12 @@ package nsmgr
 
 import (
 	"context"
+	"time"
 
+	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/recvfd"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/mechanisms/sendfd"
+	"github.com/networkservicemesh/sdk/pkg/registry/common/expire"
 	"github.com/networkservicemesh/sdk/pkg/registry/common/querycache"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
 
@@ -37,13 +42,13 @@ import (
 
 	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
 
+	"github.com/networkservicemesh/sdk/pkg/registry/common/memory"
+	registry_recvfd "github.com/networkservicemesh/sdk/pkg/registry/common/recvfd"
 	"github.com/networkservicemesh/sdk/pkg/registry/common/setid"
 	"github.com/networkservicemesh/sdk/pkg/registry/common/seturl"
 	chain_registry "github.com/networkservicemesh/sdk/pkg/registry/core/chain"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/nextwrap"
-	"github.com/networkservicemesh/sdk/pkg/registry/memory"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/client"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/chains/endpoint"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/connect"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/common/discover"
@@ -107,59 +112,40 @@ func NewServer(ctx context.Context, nsmRegistration *registryapi.NetworkServiceE
 		nsmRegistration.Name,
 		authzServer,
 		tokenGenerator,
-		nilFilter(
-			discover.NewServer(nsClient, nseClient),
-			roundrobin.NewServer(),
-			localbypass.NewServer(&localbypassRegistryServer),
-			excludedprefixes.NewServer(ctx),
-			newRecvFD(), // Receive any files passed
-			interpose.NewServer(nsmRegistration.Name, &interposeRegistry),
-			filtermechanisms.NewServer(&urlsRegistryServer),
-			connect.NewServer(
-				ctx,
-				client.NewClientFactory(nsmRegistration.Name,
-					addressof.NetworkServiceClient(
-						adapters.NewServerToClient(rv)),
-					tokenGenerator,
-				),
-				clientDialOptions...),
-		)...,
+		discover.NewServer(nsClient, nseClient),
+		roundrobin.NewServer(),
+		localbypass.NewServer(&localbypassRegistryServer),
+		excludedprefixes.NewServer(ctx),
+		recvfd.NewServer(), // Receive any files passed
+		interpose.NewServer(&interposeRegistry),
+		filtermechanisms.NewServer(&urlsRegistryServer),
+		connect.NewServer(ctx,
+			client.NewClientFactory(
+				nsmRegistration.Name,
+				addressof.NetworkServiceClient(adapters.NewServerToClient(rv)),
+				tokenGenerator,
+				recvfd.NewClient(),
+				sendfd.NewClient(), // Send passed files.
+			),
+			clientDialOptions...),
+		sendfd.NewServer(),
 	)
 
-	nsChain := chain_registry.NewNetworkServiceRegistryServer(nsRegistry)
-	nseChain := chain_registry.NewNetworkServiceEndpointRegistryServer(
-		nilEndpointFilter(
-			urlsRegistryServer,
-			newRecvFDEndpointRegistry(), // Allow to receive a passed files
-			interposeRegistry,           // Store cross connect NSEs
-			localbypassRegistryServer,   // Store endpoint Id to EndpointURL for local access.
-			seturl.NewNetworkServiceEndpointRegistryServer(nsmRegistration.Url), // Remember endpoint URL
-			nseRegistry, // Register NSE inside Remote registry with ID assigned
-		)...,
+	nsChain := chain_registry.NewNamedNetworkServiceRegistryServer(nsmRegistration.Name+".NetworkServiceRegistry", nsRegistry)
+
+	nseChain := chain_registry.NewNamedNetworkServiceEndpointRegistryServer(
+		nsmRegistration.Name+".NetworkServiceEndpointRegistry",
+		expire.NewNetworkServiceEndpointRegistryServer(time.Minute),
+		registry_recvfd.NewNetworkServiceEndpointRegistryServer(), // Allow to receive a passed files
+		urlsRegistryServer,
+		interposeRegistry,         // Store cross connect NSEs
+		localbypassRegistryServer, // Store endpoint Id to EndpointURL for local access.
+		seturl.NewNetworkServiceEndpointRegistryServer(nsmRegistration.Url), // Remember endpoint URL
+		nseRegistry, // Register NSE inside Remote registry with ID assigned
 	)
 	rv.Registry = registry.NewServer(nsChain, nseChain)
 
 	return rv
-}
-
-func nilEndpointFilter(servers ...registryapi.NetworkServiceEndpointRegistryServer) []registryapi.NetworkServiceEndpointRegistryServer {
-	result := []registryapi.NetworkServiceEndpointRegistryServer{}
-	for _, s := range servers {
-		if s != nil {
-			result = append(result, s)
-		}
-	}
-	return result
-}
-
-func nilFilter(servers ...networkservice.NetworkServiceServer) []networkservice.NetworkServiceServer {
-	result := []networkservice.NetworkServiceServer{}
-	for _, s := range servers {
-		if s != nil {
-			result = append(result, s)
-		}
-	}
-	return result
 }
 
 func newRemoteNSServer(cc grpc.ClientConnInterface) registryapi.NetworkServiceRegistryServer {

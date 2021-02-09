@@ -1,6 +1,6 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,6 +21,7 @@ package chain
 import (
 	"github.com/networkservicemesh/api/pkg/api/registry"
 
+	"github.com/networkservicemesh/sdk/pkg/registry/common/setlogoption"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/next"
 	"github.com/networkservicemesh/sdk/pkg/registry/core/trace"
 )
@@ -28,6 +29,13 @@ import (
 // NewNetworkServiceRegistryServer - creates a chain of servers
 func NewNetworkServiceRegistryServer(servers ...registry.NetworkServiceRegistryServer) registry.NetworkServiceRegistryServer {
 	return next.NewWrappedNetworkServiceRegistryServer(trace.NewNetworkServiceRegistryServer, servers...)
+}
+
+// NewNamedNetworkServiceRegistryServer - creates a chain of servers with name log option if tracing enabled
+func NewNamedNetworkServiceRegistryServer(name string, servers ...registry.NetworkServiceRegistryServer) registry.NetworkServiceRegistryServer {
+	return next.NewNetworkServiceRegistryServer(
+		setlogoption.NewNetworkServiceRegistryServer(map[string]string{"name": name}),
+		next.NewWrappedNetworkServiceRegistryServer(trace.NewNetworkServiceRegistryServer, servers...))
 }
 
 // NewNetworkServiceRegistryClient - creates a chain of clients

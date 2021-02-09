@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
+// Copyright (c) 2021 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,31 +22,35 @@ import (
 	"context"
 
 	"github.com/golang/protobuf/ptypes/empty"
+	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"github.com/pkg/errors"
 
-	"github.com/networkservicemesh/api/pkg/api/networkservice"
-
-	"github.com/networkservicemesh/sdk/pkg/tools/spanhelper"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
+	"github.com/networkservicemesh/sdk/pkg/tools/log"
 	"github.com/networkservicemesh/sdk/pkg/tools/typeutils"
 )
 
-type traceServer struct {
+type beginTraceServer struct {
 	traced networkservice.NetworkServiceServer
 }
 
+type endTraceServer struct{}
+
 // NewNetworkServiceServer - wraps tracing around the supplied traced
 func NewNetworkServiceServer(traced networkservice.NetworkServiceServer) networkservice.NetworkServiceServer {
-	return &traceServer{traced: traced}
+	return next.NewNetworkServiceServer(
+		&beginTraceServer{traced: traced},
+		&endTraceServer{},
+	)
 }
 
-func (t *traceServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
-	// Create a new span
+func (t *beginTraceServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
+	// Create a new logger
 	operation := typeutils.GetFuncName(t.traced, "Request")
-	span := spanhelper.FromContext(ctx, operation)
-	defer span.Finish()
+	ctx, finish := withLog(ctx, operation)
+	defer finish()
 
-	ctx = withLog(span.Context(), span.Logger())
-	logRequest(span, request)
+	logRequest(ctx, request)
 
 	// Actually call the next
 	rv, err := t.traced.Request(ctx, request)
@@ -52,37 +58,49 @@ func (t *traceServer) Request(ctx context.Context, request *networkservice.Netwo
 	if err != nil {
 		if _, ok := err.(stackTracer); !ok {
 			err = errors.Wrapf(err, "Error returned from %s", operation)
-			span.LogErrorf("%+v", err)
+			log.FromContext(ctx).Errorf("%+v", err)
 			return nil, err
 		}
-		span.LogErrorf("%v", err)
+		log.FromContext(ctx).Errorf("%v", err)
 		return nil, err
 	}
 
-	logResponse(span, rv)
+	logResponse(ctx, rv)
 	return rv, err
 }
 
-func (t *traceServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
-	// Create a new span
+func (t *beginTraceServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
+	// Create a new logger
 	operation := typeutils.GetFuncName(t.traced, "Close")
-	span := spanhelper.FromContext(ctx, operation)
-	defer span.Finish()
-	// Make sure we log to span
-	ctx = withLog(span.Context(), span.Logger())
+	ctx, finish := withLog(ctx, operation)
+	defer finish()
 
-	logRequest(span, conn)
+	logRequest(ctx, conn)
 	rv, err := t.traced.Close(ctx, conn)
 
 	if err != nil {
 		if _, ok := err.(stackTracer); !ok {
 			err = errors.Wrapf(err, "Error returned from %s", operation)
-			span.LogErrorf("%+v", err)
+			log.FromContext(ctx).Errorf("%+v", err)
 			return nil, err
 		}
-		span.LogErrorf("%v", err)
+		log.FromContext(ctx).Errorf("%v", err)
 		return nil, err
 	}
-	span.LogObject("response", rv)
+	logResponse(ctx, conn)
 	return rv, err
+}
+
+func (t *endTraceServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
+	logRequest(ctx, request)
+	conn, err := next.Server(ctx).Request(ctx, request)
+	logResponse(ctx, conn)
+	return conn, err
+}
+
+func (t *endTraceServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
+	logRequest(ctx, conn)
+	r, err := next.Server(ctx).Close(ctx, conn)
+	logResponse(ctx, conn)
+	return r, err
 }

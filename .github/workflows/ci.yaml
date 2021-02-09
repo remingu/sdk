@@ -36,11 +36,12 @@ jobs:
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v2
         with:
-          version: v1.31
-
+          version: v1.35.0
   excludeFmtErrorf:
     name: exclude fmt.Errorf
     runs-on: ubuntu-latest
@@ -100,8 +101,10 @@ jobs:
         run: go generate ./...
       - name: Check for changes in generated code
         run: |
-          git diff -- '*.pb.go' || ( echo "Rerun go generate ./... locally and resubmit" && false )
-          git diff -- '*.gen.go' || ( echo "Rerun go generate ./... locally and resubmit" && false )
+          if [[ $(git diff -- '*.gen.go') ]]; then
+            echo "Run go generate ./..." locally and commit changes
+            exit 1
+          fi
   excludereplace:
     name: Exclude Replace in go.mod
     runs-on: ubuntu-latest
@@ -139,13 +142,15 @@ jobs:
       fail-fast: false
       matrix:
         repository:
-          - sdk-vppagent
+          - sdk-k8s
+          - sdk-vpp
           - sdk-kernel
           - cmd-nsmgr
           - cmd-nsmgr-proxy
           - cmd-registry-memory
           - cmd-registry-proxy-dns
           - cmd-nse-icmp-responder
+          - cmd-nse-vfio
     name: Update ${{ matrix.repository }}
     runs-on: ubuntu-latest
     needs:
@@ -182,7 +187,7 @@ jobs:
       - name: Update ${{ github.repository }} locally
         working-directory: networkservicemesh/${{ matrix.repository }}
         run: |
-          GOPROXY=direct go get -u github.com/${{ github.repository }}
+          GOPRIVATE=github.com/networkservicemesh go get -u github.com/${{ github.repository }}
           go mod tidy
           git diff
       - name: Push update to the ${{ matrix.repository }}
@@ -192,6 +197,10 @@ jobs:
           git config --global user.email "nsmbot@networkservicmesh.io"
           git config --global user.name "NSMBot"
           git add go.mod go.sum
+          if ! [ -n "$(git diff --cached --exit-code)" ]; then
+            echo ${{ matrix.repository }} is up to date
+            exit 0;
+          fi
           git commit -s -F /tmp/commit-message
           git checkout -b update/${{ github.repository }}
           git push -f origin update/${{ github.repository }}

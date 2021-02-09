@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-
 	"github.com/networkservicemesh/sdk/pkg/tools/log"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 // WatchFile watches file changes even if the watching file does not exist or removed.
@@ -34,8 +34,8 @@ import (
 // Closes channel due to unexpected os error or context is done.
 func WatchFile(ctx context.Context, filePath string) <-chan []byte {
 	result := make(chan []byte)
+	logger := log.FromContext(ctx).WithField("fs.WatchFile", filePath)
 
-	logger := log.Entry(ctx).WithField("fs.WatchFile", filePath)
 	watcher, err := fsnotify.NewWatcher()
 
 	if err != nil {
@@ -75,7 +75,7 @@ func WatchFile(ctx context.Context, filePath string) <-chan []byte {
 }
 
 func monitorFile(ctx context.Context, filePath string, watcher *fsnotify.Watcher, notifyCh chan<- []byte) {
-	logger := log.Entry(ctx).WithField("fs.monitorFile", filePath)
+	logger := log.FromContext(ctx).WithField("fs.monitorFile", filePath)
 
 	bytes, _ := ioutil.ReadFile(filepath.Clean(filePath))
 	if !sendOrClose(ctx, notifyCh, bytes) {

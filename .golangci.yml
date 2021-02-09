@@ -8,12 +8,9 @@ linters-settings:
   goheader:
     template-path: ".ci/license/template.txt"
     values:
-      const:
-        year: 2020
       regexp:
-        year-range: ((\d\d\d\d-{{year}})|({{year}}))
         company: .*
-        copyright-holder: Copyright \(c\) {{year-range}} {{company}}\n\n
+        copyright-holder: Copyright \(c\) ({{year-range}}) {{company}}\n\n
         copyright-holders: ({{copyright-holder}})+
   errcheck:
     check-type-assertions: false
@@ -253,3 +250,15 @@ issues:
       linters:
         - gocyclo
       text: "processEvent"
+    - path: pkg/networkservice/common/connect/server_test.go
+      linters:
+        - funlen
+      text: "Function 'TestConnectServer_Request'"
+    - path: pkg/registry/common/recvfd/gen.go
+      linters:
+        - structcheck
+      text: "is unused"
+    - path: pkg/networkservice/common/mechanisms/recvfd/gen.go
+      linters:
+        - structcheck
+      text: "is unused"

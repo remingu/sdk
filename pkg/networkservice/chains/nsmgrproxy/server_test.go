@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -21,19 +21,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
+
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
 	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/cls"
 	"github.com/networkservicemesh/api/pkg/api/networkservice/mechanisms/kernel"
 	"github.com/networkservicemesh/api/pkg/api/registry"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/goleak"
 
 	"github.com/networkservicemesh/sdk/pkg/tools/sandbox"
 )
 
 func TestNSMGR_InterdomainUseCase(t *testing.T) {
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
 	const remoteRegistryDomain = "domain2.local.registry"
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
@@ -60,11 +63,10 @@ func TestNSMGR_InterdomainUseCase(t *testing.T) {
 		NetworkServiceNames: []string{"my-service-interdomain"},
 	}
 
-	_, err := sandbox.NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken, domain2.Nodes[0].NSMgr)
+	_, err := domain2.Nodes[0].NewEndpoint(ctx, nseReg, sandbox.GenerateTestToken)
 	require.NoError(t, err)
 
-	nsc, err := sandbox.NewClient(ctx, sandbox.GenerateTestToken, domain1.Nodes[0].NSMgr.URL)
-	require.NoError(t, err)
+	nsc := domain1.Nodes[0].NewClient(ctx, sandbox.GenerateTestToken)
 
 	request := &networkservice.NetworkServiceRequest{
 		MechanismPreferences: []*networkservice.Mechanism{
@@ -86,9 +88,7 @@ func TestNSMGR_InterdomainUseCase(t *testing.T) {
 	// Simulate refresh from client.
 
 	refreshRequest := request.Clone()
-	refreshRequest.GetConnection().Context = conn.Context
-	refreshRequest.GetConnection().Mechanism = conn.Mechanism
-	refreshRequest.GetConnection().NetworkServiceEndpointName = conn.NetworkServiceEndpointName
+	refreshRequest.Connection = conn.Clone()
 
 	conn, err = nsc.Request(ctx, refreshRequest)
 	require.NoError(t, err)

@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
+// Copyright (c) 2021 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,18 +22,21 @@ package chain
 
 import (
 	"github.com/networkservicemesh/api/pkg/api/networkservice"
-	"github.com/sirupsen/logrus"
 
-	"github.com/networkservicemesh/sdk/pkg/networkservice/common/tracehelper"
+	"github.com/networkservicemesh/sdk/pkg/networkservice/common/setlogoption"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/next"
 	"github.com/networkservicemesh/sdk/pkg/networkservice/core/trace"
 )
 
 // NewNetworkServiceServer - chains together a list of networkservice.Servers with tracing
 func NewNetworkServiceServer(servers ...networkservice.NetworkServiceServer) networkservice.NetworkServiceServer {
-	if logrus.GetLevel() == logrus.TraceLevel {
-		servers = append([]networkservice.NetworkServiceServer{tracehelper.NewServer()}, servers...)
-		return next.NewWrappedNetworkServiceServer(trace.NewNetworkServiceServer, servers...)
-	}
-	return next.NewNetworkServiceServer(servers...)
+	return next.NewWrappedNetworkServiceServer(trace.NewNetworkServiceServer, servers...)
+}
+
+// NewNamedNetworkServiceServer - chains together a list of networkservice.Servers with tracing and name log option
+func NewNamedNetworkServiceServer(name string, servers ...networkservice.NetworkServiceServer) networkservice.NetworkServiceServer {
+	return next.NewNetworkServiceServer(
+		setlogoption.NewServer(map[string]string{"name": name}),
+		next.NewWrappedNetworkServiceServer(trace.NewNetworkServiceServer, servers...),
+	)
 }

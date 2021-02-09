@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
+// Copyright (c) 2021 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,34 +16,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package trace provides a wrapper for tracing around a registry.{Registry,Discovery}{Server,Client}
 package trace
 
 import (
 	"context"
 
-	"github.com/sirupsen/logrus"
+	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
+	"github.com/networkservicemesh/sdk/pkg/tools/log"
+	"github.com/networkservicemesh/sdk/pkg/tools/log/logruslogger"
+	"github.com/networkservicemesh/sdk/pkg/tools/log/spanlogger"
 )
 
-type contextKeyType string
-
-const (
-	logKey contextKeyType = "Log"
-)
-
-// withLog -
-//   Provides a FieldLogger in context
-func withLog(parent context.Context, log logrus.FieldLogger) context.Context {
+// withLog - provides corresponding logger in context
+func withLog(parent context.Context, operation string) (c context.Context, f func()) {
 	if parent == nil {
 		panic("cannot create context from nil parent")
 	}
-	return context.WithValue(parent, logKey, log)
-}
 
-// Log - return FieldLogger from context
-func Log(ctx context.Context) logrus.FieldLogger {
-	if rv, ok := ctx.Value(logKey).(logrus.FieldLogger); ok {
-		return rv
+	// Update outgoing grpc context
+	parent = grpcutils.PassTraceToOutgoing(parent)
+
+	if grpcTraceState := grpcutils.TraceFromContext(parent); (grpcTraceState == grpcutils.TraceOn) ||
+		(grpcTraceState == grpcutils.TraceUndefined && log.IsTracingEnabled()) {
+		ctx, sLogger, span, sFinish := spanlogger.FromContext(parent, operation)
+		ctx, lLogger, lFinish := logruslogger.FromSpan(ctx, span, operation)
+		return log.WithLog(ctx, sLogger, lLogger), func() {
+			sFinish()
+			lFinish()
+		}
 	}
-	return logrus.New()
+	return log.WithLog(parent), func() {}
 }

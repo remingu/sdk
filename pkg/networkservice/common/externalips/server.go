@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Doc.ai and/or its affiliates.
+// Copyright (c) 2020-2021 Doc.ai and/or its affiliates.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -68,7 +68,7 @@ func NewServer(chainCtx context.Context, options ...Option) networkservice.Netwo
 		result.updateCh = monitorMapFromFile(chainCtx, DefaultFilePath)
 	}
 	go func() {
-		logger := log.Entry(chainCtx).WithField("externalIPsServer", "build")
+		logger := log.FromContext(chainCtx).WithField("externalIPsServer", "build")
 		for {
 			select {
 			case <-chainCtx.Done():
@@ -126,7 +126,7 @@ func monitorMapFromFile(ctx context.Context, path string) <-chan map[string]stri
 			var m map[string]string
 			err := yaml.Unmarshal(bytes, &m)
 			if err != nil {
-				log.Entry(ctx).WithField("externalIPsServer", "yaml.Unmarshal").Error(err.Error())
+				log.FromContext(ctx).WithField("externalIPsServer", "yaml.Unmarshal").Error(err.Error())
 				continue
 			}
 			select {

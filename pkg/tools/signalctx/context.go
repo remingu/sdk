@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco and/or its affiliates.
 //
+// Copyright (c) 2021 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +50,7 @@ func WithSignals(parent context.Context, sig ...os.Signal) context.Context {
 	go func() {
 		select {
 		case s := <-c:
-			log.Entry(ctx).Warnf("Caught signal %s, exiting...", s)
+			log.FromContext(ctx).Warnf("Caught signal %s, exiting...", s)
 			cancel()
 		case <-parent.Done():
 		}

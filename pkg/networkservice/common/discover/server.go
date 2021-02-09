@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Cisco Systems, Inc.
+// Copyright (c) 2020-2021 Cisco Systems, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -48,58 +48,168 @@ func NewServer(nsClient registry.NetworkServiceRegistryClient, nseClient registr
 func (d *discoverCandidatesServer) Request(ctx context.Context, request *networkservice.NetworkServiceRequest) (*networkservice.Connection, error) {
 	nseName := request.GetConnection().GetNetworkServiceEndpointName()
 	if nseName != "" {
-		nseStream, err := d.nseClient.Find(context.Background(), &registry.NetworkServiceEndpointQuery{
-			NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
-				Name: nseName,
-			},
-		})
+		nse, err := d.discoverNetworkServiceEndpoint(ctx, nseName)
 		if err != nil {
 			return nil, err
 		}
-		nseList := registry.ReadNetworkServiceEndpointList(nseStream)
-		if len(nseList) == 0 {
-			return nil, errors.Errorf("network service endpoint %s is not found", nseName)
-		}
-		u, err := url.Parse(nseList[0].Url)
+		u, err := url.Parse(nse.Url)
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		return next.Server(ctx).Request(clienturlctx.WithClientURL(ctx, u), request)
 	}
-	nseStream, err := d.nseClient.Find(ctx, &registry.NetworkServiceEndpointQuery{
-		NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
-			NetworkServiceNames: []string{request.GetConnection().GetNetworkService()},
-		},
-	})
+	ns, err := d.discoverNetworkService(ctx, request.GetConnection().GetNetworkService(), request.GetConnection().GetPayload())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
-
-	nseList := registry.ReadNetworkServiceEndpointList(nseStream)
-
-	nsStream, err := d.nsClient.Find(ctx, &registry.NetworkServiceQuery{
-		NetworkService: &registry.NetworkService{
-			Name: request.GetConnection().GetNetworkService(),
-		},
-	})
+	nses, err := d.discoverNetworkServiceEndpoints(ctx, ns, request.GetConnection().GetLabels())
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
-
-	nsList := registry.ReadNetworkServiceList(nsStream)
-	if len(nsList) == 0 {
-		return nil, errors.Errorf("network service %s is not found", request.GetConnection().GetNetworkService())
+	for ctx.Err() == nil {
+		resp, err := next.Server(ctx).Request(WithCandidates(ctx, nses, ns), request)
+		if err == nil {
+			return resp, err
+		}
+		nses, err = d.discoverNetworkServiceEndpoints(ctx, ns, request.GetConnection().GetLabels())
+		if err != nil {
+			return nil, err
+		}
 	}
-	nseList = matchEndpoint(request.GetConnection().GetLabels(), nsList[0], nseList)
-
-	if len(nseList) == 0 {
-		return nil, errors.Errorf("network service endpoint for service %s is not found", request.GetConnection().GetNetworkService())
-	}
-
-	ctx = WithCandidates(ctx, nseList, nsList[0])
-	return next.Server(ctx).Request(ctx, request)
+	return nil, errors.Wrap(ctx.Err(), "no match endpoints or all endpoints fail")
 }
 
-func (d *discoverCandidatesServer) Close(context.Context, *networkservice.Connection) (*empty.Empty, error) {
-	return &empty.Empty{}, nil
+func (d *discoverCandidatesServer) Close(ctx context.Context, conn *networkservice.Connection) (*empty.Empty, error) {
+	nseName := conn.GetNetworkServiceEndpointName()
+	if nseName == "" {
+		// If it's an existing connection, the NSE name should be set. Otherwise, it's probably an API misuse.
+		return nil, errors.Errorf("network_service_endpoint_name is not set")
+	}
+	nse, err := d.discoverNetworkServiceEndpoint(ctx, nseName)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(nse.Url)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return next.Server(ctx).Close(clienturlctx.WithClientURL(ctx, u), conn)
+}
+
+func (d *discoverCandidatesServer) discoverNetworkServiceEndpoint(ctx context.Context, nseName string) (*registry.NetworkServiceEndpoint, error) {
+	query := &registry.NetworkServiceEndpointQuery{
+		NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
+			Name: nseName,
+		},
+	}
+
+	nseStream, err := d.nseClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	nseList := registry.ReadNetworkServiceEndpointList(nseStream)
+
+	for _, nse := range nseList {
+		if nse.Name == nseName {
+			return nse, nil
+		}
+	}
+
+	query.Watch = true
+
+	nseStream, err = d.nseClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for {
+		var nse *registry.NetworkServiceEndpoint
+		if nse, err = nseStream.Recv(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		if nse.Name == nseName {
+			return nse, nil
+		}
+	}
+}
+
+func (d *discoverCandidatesServer) discoverNetworkServiceEndpoints(ctx context.Context, ns *registry.NetworkService, labels map[string]string) ([]*registry.NetworkServiceEndpoint, error) {
+	query := &registry.NetworkServiceEndpointQuery{
+		NetworkServiceEndpoint: &registry.NetworkServiceEndpoint{
+			NetworkServiceNames: []string{ns.Name},
+		},
+	}
+
+	nseStream, err := d.nseClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	nseList := registry.ReadNetworkServiceEndpointList(nseStream)
+
+	result := matchEndpoint(labels, ns, nseList...)
+	if len(result) != 0 {
+		return result, nil
+	}
+
+	query.Watch = true
+
+	ctx, cancelFind := context.WithCancel(ctx)
+	defer cancelFind()
+
+	nseStream, err = d.nseClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for {
+		var nse *registry.NetworkServiceEndpoint
+		if nse, err = nseStream.Recv(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		result = matchEndpoint(labels, ns, nse)
+		if len(result) != 0 {
+			return result, nil
+		}
+	}
+}
+
+func (d *discoverCandidatesServer) discoverNetworkService(ctx context.Context, name, payload string) (*registry.NetworkService, error) {
+	query := &registry.NetworkServiceQuery{
+		NetworkService: &registry.NetworkService{
+			Name:    name,
+			Payload: payload,
+		},
+	}
+
+	nsStream, err := d.nsClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	nsList := registry.ReadNetworkServiceList(nsStream)
+
+	for _, ns := range nsList {
+		if ns.Name == name {
+			return ns, nil
+		}
+	}
+
+	ctx, cancelFind := context.WithCancel(ctx)
+	defer cancelFind()
+
+	query.Watch = true
+
+	nsStream, err = d.nsClient.Find(ctx, query)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for {
+		var ns *registry.NetworkService
+		if ns, err = nsStream.Recv(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+
+		if ns.Name == name {
+			return ns, nil
+		}
+	}
 }

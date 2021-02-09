@@ -1,5 +1,7 @@
 // Copyright (c) 2020 Cisco Systems, Inc.
 //
+// Copyright (c) 2021 Doc.ai and/or its affiliates.
+//
 // SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,39 +22,64 @@ package trace
 import (
 	"context"
 
-	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/networkservicemesh/sdk/pkg/tools/grpcutils"
+	"github.com/networkservicemesh/sdk/pkg/tools/log"
+	"github.com/networkservicemesh/sdk/pkg/tools/log/logruslogger"
+	"github.com/networkservicemesh/sdk/pkg/tools/log/spanlogger"
 )
 
 type contextKeyType string
 
 const (
-	logKey contextKeyType = "Log"
+	traceInfoKey contextKeyType = "ConnectionInfo"
 )
 
-// withLog - Provides a FieldLogger in context
-func withLog(parent context.Context, log logrus.FieldLogger) context.Context {
+// ConnectionInfo - struct, containing string representations of request and response, used for tracing.
+type traceInfo struct {
+	// Request is last request of NetworkService{Client, Server}
+	Request proto.Message
+	// Response is last response of NetworkService{Client, Server}
+	Response proto.Message
+}
+
+// withLog - provides corresponding logger in context
+func withLog(parent context.Context, operation string) (c context.Context, f func()) {
 	if parent == nil {
 		panic("cannot create context from nil parent")
 	}
-	return context.WithValue(parent, logKey, log)
+
+	// Update outgoing grpc context
+	parent = grpcutils.PassTraceToOutgoing(parent)
+
+	if grpcTraceState := grpcutils.TraceFromContext(parent); (grpcTraceState == grpcutils.TraceOn) ||
+		(grpcTraceState == grpcutils.TraceUndefined && log.IsTracingEnabled()) {
+		ctx, sLogger, span, sFinish := spanlogger.FromContext(parent, operation)
+		ctx, lLogger, lFinish := logruslogger.FromSpan(ctx, span, operation)
+		return withTrace(log.WithLog(ctx, sLogger, lLogger)), func() {
+			sFinish()
+			lFinish()
+		}
+	}
+	return log.WithLog(parent), func() {}
 }
 
-// Log - return FieldLogger from context
-func Log(ctx context.Context) logrus.FieldLogger {
-	rv, ok := ctx.Value(logKey).(logrus.FieldLogger)
-	if !ok {
-		logger := &logrus.Logger{
-			Out:          logrus.StandardLogger().Out,
-			Formatter:    logrus.StandardLogger().Formatter,
-			Hooks:        make(logrus.LevelHooks),
-			Level:        logrus.StandardLogger().Level,
-			ExitFunc:     logrus.StandardLogger().ExitFunc,
-			ReportCaller: logrus.StandardLogger().ReportCaller,
-		}
-		for k, v := range logrus.StandardLogger().Hooks {
-			logger.Hooks[k] = v
-		}
-		rv = logger
+// withConnectionInfo - Provides a traceInfo in context
+func withTrace(parent context.Context) context.Context {
+	if parent == nil {
+		panic("cannot create context from nil parent")
 	}
-	return rv
+	if _, ok := trace(parent); ok {
+		// We already had connection info
+		return parent
+	}
+
+	return context.WithValue(parent, traceInfoKey, &traceInfo{})
+}
+
+// ConnectionInfo - return traceInfo from context
+func trace(ctx context.Context) (*traceInfo, bool) {
+	val, ok := ctx.Value(traceInfoKey).(*traceInfo)
+	return val, ok
 }
